@@ -1,0 +1,42 @@
+# Ignorar archivos de entorno
+.env
+.env.local
+
+# ⚠️ ARCHIVOS PHP DE PRUEBA (NO DEBERÍAN CREARSE)
+*_check.php
+*_test.php
+
+# 📊 DIAGRAMAS MERMAID (deben estar en RAG, no como archivos)
+diagrama_*.mmd
+
+# Directorios Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# RAG Storage (opcional, comentar si quieres versionarlo)
+rag_storage/
+memory_storage/
+prompt_storage/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Sistema
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
