@@ -22,6 +22,7 @@ from external_integrations import ExternalIntegrations
 from report_generator import ReportGenerator
 from ci_cd_tools import CICDTools
 from php_curl_analyzer import PHPCurlAnalyzer
+from architect_mode import Architect
 
 # Instancias globales
 _rag_storage = RAGStorage()
@@ -34,6 +35,7 @@ _external_integrations = ExternalIntegrations()
 _report_generator = ReportGenerator(rag_storage=_rag_storage)  # Compartir instancia
 _ci_cd_tools = CICDTools()
 _php_curl_analyzer = PHPCurlAnalyzer(base_url="http://172.16.12.178")
+_architect = Architect()
 
 
 def _should_ignore(path: Path) -> bool:
@@ -59,16 +61,76 @@ def _should_ignore(path: Path) -> bool:
     return False
 
 
-def explore_directory(directory: str, recursive: bool = True, max_depth: int = 10) -> Dict[str, Any]:
+def _analyze_file_architecture(file_path: Path, file_info: Dict, architecture: Dict) -> None:
     """
-    Explora un directorio y retorna su estructura.
+    Analiza un archivo para detectar patrones arquitectónicos.
+    Detecta frameworks, entry points, configs, dependencias.
+    """
+    name = file_path.name.lower()
+    ext = file_path.suffix.lower()
+    
+    # Detectar lenguajes
+    if ext in CODE_EXTENSIONS:
+        architecture["detected_languages"].add(CODE_EXTENSIONS[ext])
+    
+    # Entry points comunes
+    if name in ["main.py", "app.py", "index.js", "index.php", "server.js", "main.go", "main.java"]:
+        architecture["entry_points"].append(str(file_path))
+    
+    # Archivos de dependencias
+    if name in ["requirements.txt", "package.json", "composer.json", "pom.xml", "build.gradle", 
+                "go.mod", "cargo.toml", "gemfile", "pipfile"]:
+        architecture["dependency_files"].append(str(file_path))
+    
+    # Archivos de configuración
+    if name in ["config.py", "settings.py", ".env", "config.json", "app.config", 
+                "web.config", "application.properties", "application.yml"]:
+        architecture["config_files"].append(str(file_path))
+    
+    # Archivos de build
+    if name in ["makefile", "dockerfile", "docker-compose.yml", "webpack.config.js", 
+                "gulpfile.js", "gruntfile.js", "setup.py", "pyproject.toml"]:
+        architecture["build_files"].append(str(file_path))
+    
+    # Detectar frameworks por archivos característicos
+    if name == "manage.py":
+        if "Django" not in architecture["detected_frameworks"]:
+            architecture["detected_frameworks"].append("Django")
+    elif name == "app.py" or name == "wsgi.py":
+        if "Flask" not in architecture["detected_frameworks"]:
+            architecture["detected_frameworks"].append("Flask/WSGI")
+    elif name == "package.json":
+        # Podría leer el contenido para detectar React/Vue/Angular
+        if "Node.js" not in architecture["detected_frameworks"]:
+            architecture["detected_frameworks"].append("Node.js")
+    elif name == "composer.json":
+        if "PHP/Composer" not in architecture["detected_frameworks"]:
+            architecture["detected_frameworks"].append("PHP/Composer")
+    elif ext == ".java" and "pom.xml" in str(file_path.parent):
+        if "Maven" not in architecture["detected_frameworks"]:
+            architecture["detected_frameworks"].append("Maven")
+    
+    # Detectar directorios de tests
+    if "test" in str(file_path.parent).lower() or "tests" in str(file_path.parent).lower():
+        test_dir = str(file_path.parent)
+        if test_dir not in architecture["test_directories"]:
+            architecture["test_directories"].append(test_dir)
+
+
+def explore_directory(directory: str, recursive: bool = True, max_depth: int = None, analyze_architecture: bool = True) -> Dict[str, Any]:
+    """
+    Explora un directorio exhaustivamente y retorna su estructura completa.
+    Ahora sin límites artificiales para seguir ModoGorila.
     
     Args:
         directory: Ruta del directorio a explorar
         recursive: Si debe explorar subdirectorios
-        max_depth: Profundidad máxima de exploración
+        max_depth: Profundidad máxima (None = sin límite, por defecto)
+        analyze_architecture: Si debe detectar patrones arquitectónicos
     """
-    print(f"⚙️ Explorando directorio: {directory}")
+    print(f"⚙️ [EXPLORACIÓN PROFUNDA] Analizando directorio: {directory}")
+    if max_depth is None:
+        print("   🔓 Sin límite de profundidad - análisis exhaustivo")
     
     try:
         path = Path(directory).resolve()
@@ -86,13 +148,27 @@ def explore_directory(directory: str, recursive: bool = True, max_depth: int = 1
             "stats": {
                 "total_files": 0,
                 "by_type": {},
-                "ignored": 0
-            }
+                "ignored": 0,
+                "max_depth_reached": 0
+            },
+            "architecture": {
+                "detected_frameworks": [],
+                "detected_languages": set(),
+                "entry_points": [],
+                "config_files": [],
+                "dependency_files": [],
+                "test_directories": [],
+                "build_files": []
+            } if analyze_architecture else None
         }
         
         def explore_recursive(current_path: Path, depth: int = 0):
-            if depth > max_depth:
+            if max_depth is not None and depth > max_depth:
                 return
+            
+            # Actualizar profundidad máxima alcanzada
+            if depth > result["stats"]["max_depth_reached"]:
+                result["stats"]["max_depth_reached"] = depth
             
             try:
                 for item in current_path.iterdir():
@@ -115,6 +191,10 @@ def explore_directory(directory: str, recursive: bool = True, max_depth: int = 1
                         # Contar por tipo
                         file_type = file_info["type"]
                         result["stats"]["by_type"][file_type] = result["stats"]["by_type"].get(file_type, 0) + 1
+                        
+                        # Análisis arquitectónico
+                        if analyze_architecture:
+                            _analyze_file_architecture(item, file_info, result["architecture"])
                     
                     elif item.is_dir() and recursive:
                         result["subdirectories"].append(str(item))
@@ -127,7 +207,29 @@ def explore_directory(directory: str, recursive: bool = True, max_depth: int = 1
         
         explore_recursive(path)
         
-        print(f"✅ Exploración completada: {result['stats']['total_files']} archivos encontrados")
+        # Convertir sets a listas para JSON
+        if analyze_architecture and result["architecture"]:
+            result["architecture"]["detected_languages"] = list(result["architecture"]["detected_languages"])
+        
+        # Resumen de exploración
+        print(f"✅ Exploración completada:")
+        print(f"   📊 Archivos: {result['stats']['total_files']}")
+        print(f"   📁 Subdirectorios: {len(result['subdirectories'])}")
+        print(f"   🗂️  Profundidad alcanzada: {result['stats']['max_depth_reached']}")
+        print(f"   🚫 Ignorados: {result['stats']['ignored']}")
+        
+        if analyze_architecture and result["architecture"]:
+            arch = result["architecture"]
+            print(f"\n🏗️  ARQUITECTURA DETECTADA:")
+            if arch["detected_frameworks"]:
+                print(f"   Frameworks: {', '.join(arch['detected_frameworks'])}")
+            if arch["detected_languages"]:
+                print(f"   Lenguajes: {', '.join(arch['detected_languages'])}")
+            if arch["entry_points"]:
+                print(f"   Entry points: {len(arch['entry_points'])}")
+            if arch["dependency_files"]:
+                print(f"   Archivos de dependencias: {len(arch['dependency_files'])}")
+        
         return result
     
     except Exception as e:
@@ -793,6 +895,47 @@ def test_php_endpoint(file_path: str, custom_params: Dict = None) -> Dict[str, A
         }
 
 
+def generate_analysis_plan(
+    repository_path: str,
+    user_requirements: str,
+    scope: str = "full"
+) -> Dict[str, Any]:
+    """
+    Genera un plan de análisis estructurado usando el Arquitecto.
+    Sigue ModoGorila: Contract-Driven con Spec Pack, DoD y TestPlan.
+    
+    Args:
+        repository_path: Ruta del repositorio a analizar
+        user_requirements: Descripción de lo que el usuario necesita analizar
+        scope: Alcance del análisis (full, quick, targeted)
+    
+    Returns:
+        Plan estructurado con pasos, contratos, DoD y métricas
+    """
+    print(f"\n🏗️  [ARQUITECTO] Iniciando generación de plan...")
+    
+    try:
+        plan = _architect.generate_analysis_plan(
+            repository_path=repository_path,
+            user_requirements=user_requirements,
+            scope=scope
+        )
+        
+        return {
+            "success": True,
+            "plan": plan,
+            "message": "Plan de análisis generado exitosamente"
+        }
+    
+    except Exception as e:
+        print(f"❌ Error generando plan: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "message": "Error al generar plan de análisis"
+        }
+
+
 def batch_add_curl_to_php_files(limit: int = 50) -> Dict[str, Any]:
     """
     Procesa múltiples archivos PHP del RAG y genera curl para todos.
@@ -850,6 +993,7 @@ def batch_add_curl_to_php_files(limit: int = 50) -> Dict[str, Any]:
 
 # Registro de funciones disponibles
 TOOL_FUNCTIONS = {
+    "generate_analysis_plan": generate_analysis_plan,
     "list_files_in_dir": list_files_in_dir,
     "explore_directory": explore_directory,
     "read_file": read_file,
@@ -899,8 +1043,34 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "generate_analysis_plan",
+            "description": "🏗️ [ARQUITECTO] Genera un plan de análisis estructurado siguiendo ModoGorila. Crea Spec Pack, contratos, DoD, TestPlan y pasos incrementales. USA ESTA HERRAMIENTA PRIMERO antes de explorar o analizar un repositorio completo.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repository_path": {
+                        "type": "string",
+                        "description": "Ruta del repositorio a analizar"
+                    },
+                    "user_requirements": {
+                        "type": "string",
+                        "description": "Descripción detallada de lo que el usuario necesita: análisis completo, búsqueda específica, auditoría, documentación, etc."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["full", "quick", "targeted"],
+                        "description": "Alcance: full=análisis exhaustivo completo, quick=exploración rápida de estructura, targeted=análisis enfocado en archivos/módulos específicos"
+                    }
+                },
+                "required": ["repository_path", "user_requirements"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "explore_directory",
-            "description": "Explora un directorio y retorna su estructura completa con archivos y subdirectorios. Ignora automáticamente archivos binarios y directorios comunes como node_modules, __pycache__, etc.",
+            "description": "Explora un directorio exhaustivamente y retorna su estructura completa con detección de arquitectura, frameworks, entry points, dependencias. SIN LÍMITES de profundidad por defecto. Ignora automáticamente archivos binarios y directorios comunes.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -914,7 +1084,11 @@ TOOLS = [
                     },
                     "max_depth": {
                         "type": "integer",
-                        "description": "Profundidad máxima de exploración (default: 10)"
+                        "description": "Profundidad máxima de exploración. null=sin límite (recomendado para análisis exhaustivo), número=limitar a N niveles"
+                    },
+                    "analyze_architecture": {
+                        "type": "boolean",
+                        "description": "Si debe detectar patrones arquitectónicos, frameworks, entry points, dependencias (default: true)"
                     }
                 },
                 "required": ["directory"]
