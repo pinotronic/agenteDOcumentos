@@ -13,9 +13,14 @@ class PromptManager:
     """Gestiona prompts del sistema usando ChromaDB."""
     
     def __init__(self, storage_path: str = "prompt_storage"):
-        """Inicializa el gestor de prompts con ChromaDB."""
-        self.client = chromadb.PersistentClient(
-            path=storage_path,
+        """
+        Inicializa el gestor de prompts con ChromaDB.
+        
+        Nota: Usando EphemeralClient por incompatibilidad de ChromaDB 1.3.6 
+        con Python 3.13 en Windows.
+        """
+        # Usar cliente en memoria por compatibilidad con Python 3.13
+        self.client = chromadb.EphemeralClient(
             settings=Settings(anonymized_telemetry=False, allow_reset=True)
         )
         

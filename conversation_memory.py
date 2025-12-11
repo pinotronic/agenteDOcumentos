@@ -20,10 +20,13 @@ class ConversationMemory:
         Args:
             storage_path: Directorio para ChromaDB
             user_id: ID del usuario (para multi-usuario)
+        
+        Nota: Usando EphemeralClient por incompatibilidad de ChromaDB 1.3.6 
+        con Python 3.13 en Windows.
         """
         self.user_id = user_id
-        self.client = chromadb.PersistentClient(
-            path=storage_path,
+        # Usar cliente en memoria por compatibilidad con Python 3.13
+        self.client = chromadb.EphemeralClient(
             settings=Settings(anonymized_telemetry=False, allow_reset=True)
         )
         

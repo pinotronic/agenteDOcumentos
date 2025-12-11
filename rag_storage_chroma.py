@@ -3,6 +3,7 @@ Sistema de almacenamiento RAG con ChromaDB (Vectorial + Rápido).
 Reemplazo del sistema JSON por base de datos vectorial para búsquedas semánticas ultra-rápidas.
 """
 import json
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any
@@ -23,13 +24,17 @@ class RAGStorage:
         
         Args:
             storage_path: Directorio donde ChromaDB almacenará los vectores
+        
+        Nota: Usando EphemeralClient por incompatibilidad de ChromaDB 1.3.6 
+        con Python 3.13 en Windows (PanicException en rust bindings).
         """
         self.storage_path = Path(storage_path)
         self.storage_path.mkdir(exist_ok=True)
         
-        # Inicializar ChromaDB
-        self.client = chromadb.PersistentClient(
-            path=str(self.storage_path / "chromadb"),
+        # Usar cliente en memoria (EphemeralClient) para evitar bug de ChromaDB 1.3.6
+        # con Python 3.13 en Windows que causa: PanicException "range start index out of range"
+        print("ℹ️  Usando ChromaDB en modo memoria (compatible con Python 3.13)")
+        self.client = chromadb.EphemeralClient(
             settings=Settings(
                 anonymized_telemetry=False,
                 allow_reset=True
