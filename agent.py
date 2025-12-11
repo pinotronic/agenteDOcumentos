@@ -93,12 +93,18 @@ class Agent:
         # Seleccionar modelo apropiado
         model = REASONING_MODEL if force_reasoning else self.model
         
-        return self.client.chat.completions.create(
-            model=model,
-            messages=self.messages,
-            tools=self.tools,
-            temperature=0.3  # Temperatura moderada para balance creatividad/precisión
-        )
+        # Modelos de razonamiento (o3-mini) no soportan temperature
+        params = {
+            "model": model,
+            "messages": self.messages,
+            "tools": self.tools
+        }
+        
+        # Solo agregar temperature si NO es un modelo de razonamiento
+        if model != REASONING_MODEL:
+            params["temperature"] = 0.3
+        
+        return self.client.chat.completions.create(**params)
     
     def execute_tool_call(self, tool_call):
         """
