@@ -3,10 +3,14 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = [('.env.example', '.'), ('README.md', '.'), ('MEMORIA_CONVERSACIONAL.md', '.')]
 binaries = []
-hiddenimports = ['chromadb', 'openai', 'tiktoken']
+hiddenimports = ['chromadb', 'openai', 'tiktoken', 'onnxruntime', 'tokenizers']
 tmp_ret = collect_all('chromadb')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('openai')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('onnxruntime')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('tokenizers')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 

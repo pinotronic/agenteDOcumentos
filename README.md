@@ -474,3 +474,5 @@ Este es un sistema modular diseñado para extensión:
 ## 📝 Licencia
 
 MIT License - Libre para uso personal y comercial
+
+activar el ambiente virtual: .\env\Scripts\Activate.ps1
