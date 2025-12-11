@@ -25,6 +25,8 @@ from php_curl_analyzer import PHPCurlAnalyzer
 from architect_mode import Architect
 from contract_validator import ContractValidator, DoDChecker
 from quality_gate import QualityGate
+from evidence_generator import EvidenceGenerator
+from incremental_committer import IncrementalCommitter
 
 # Instancias globales
 _rag_storage = RAGStorage()
@@ -41,6 +43,8 @@ _architect = Architect()
 _contract_validator = ContractValidator()
 _dod_checker = DoDChecker()
 _quality_gate = QualityGate()
+_evidence_generator = EvidenceGenerator()
+_incremental_committer = IncrementalCommitter()
 
 
 def _should_ignore(path: Path) -> bool:
@@ -1069,6 +1073,177 @@ def run_quality_gates(
         }
 
 
+def generate_execution_evidence(
+    step_title: str,
+    gates_result: Dict = None,
+    dod_result: Dict = None,
+    validation_result: Dict = None,
+    custom_data: Dict = None
+) -> Dict[str, Any]:
+    """
+    Genera evidencia estructurada completa de ejecución de un paso.
+    Incluye gates, DoD, validaciones y métricas.
+    
+    Args:
+        step_title: Título del paso ejecutado
+        gates_result: Resultado de quality gates
+        dod_result: Resultado de verificación de DoD
+        validation_result: Resultado de validación de contratos
+        custom_data: Datos adicionales personalizados
+    
+    Returns:
+        Evidencia estructurada en formato estándar
+    """
+    print(f"\n📋 [EVIDENCE] Generando evidencia para: {step_title}...")
+    
+    try:
+        evidence = _evidence_generator.generate_execution_evidence(
+            step_title=step_title,
+            gates_result=gates_result,
+            dod_result=dod_result,
+            validation_result=validation_result,
+            custom_data=custom_data
+        )
+        
+        # Exportar a Markdown
+        markdown = _evidence_generator.export_evidence_to_markdown(evidence)
+        
+        return {
+            "success": True,
+            "evidence": evidence,
+            "markdown": markdown,
+            "message": "Evidencia generada exitosamente"
+        }
+    
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+def generate_unified_diff(
+    file_path: str,
+    original_content: str,
+    modified_content: str
+) -> Dict[str, Any]:
+    """
+    Genera unified diff entre contenido original y modificado.
+    
+    Args:
+        file_path: Ruta del archivo
+        original_content: Contenido original
+        modified_content: Contenido modificado
+    
+    Returns:
+        Diff unificado con estadísticas
+    """
+    print(f"\n📝 [DIFF] Generando diff para: {file_path}...")
+    
+    try:
+        diff_result = _evidence_generator.generate_unified_diff(
+            file_path=file_path,
+            original_content=original_content,
+            modified_content=modified_content
+        )
+        
+        print(f"   +{diff_result['stats']['additions']} -{diff_result['stats']['deletions']}")
+        
+        return {
+            "success": True,
+            "diff": diff_result
+        }
+    
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+def create_incremental_commit(
+    message: str,
+    files_to_add: List[str] = None,
+    include_dod: bool = True,
+    dod_data: Dict = None,
+    evidence_data: Dict = None
+) -> Dict[str, Any]:
+    """
+    Crea un commit incremental siguiendo ModoGorila.
+    Verifica límite ≤200 líneas y genera mensaje estructurado.
+    
+    Args:
+        message: Mensaje base del commit
+        files_to_add: Archivos a agregar (None = todos)
+        include_dod: Si debe incluir DoD en mensaje
+        dod_data: Datos de DoD para incluir
+        evidence_data: Datos de evidencia para incluir
+    
+    Returns:
+        Resultado del commit con hash y estadísticas
+    """
+    print(f"\n💾 [COMMIT] Creando commit incremental...")
+    
+    try:
+        # Analizar tamaño de cambios primero
+        change_analysis = _incremental_committer.analyze_change_size(files_to_add)
+        
+        if not change_analysis.get("within_limit", True):
+            print(f"   ⚠️  Cambios exceden límite: {change_analysis['total_changes']} > 200 líneas")
+            print(f"   💡 Recomendación: Dividir en múltiples commits")
+        
+        # Crear commit
+        result = _incremental_committer.create_commit(
+            message=message,
+            files_to_add=files_to_add,
+            include_dod=include_dod,
+            dod_data=dod_data,
+            evidence_data=evidence_data
+        )
+        
+        if result.get("success"):
+            print(f"   ✅ Commit creado: {result.get('commit_hash', 'N/A')[:8]}")
+            print(f"   📊 Cambios: {result['changes']['total_changes']} líneas")
+        
+        return result
+    
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+def check_git_status() -> Dict[str, Any]:
+    """
+    Verifica el estado del repositorio Git.
+    
+    Returns:
+        Estado con archivos modificados, staged, untracked
+    """
+    print(f"\n📂 [GIT] Verificando estado del repositorio...")
+    
+    try:
+        status = _incremental_committer.check_git_status()
+        
+        if status.get("is_git_repo"):
+            print(f"   ✅ Repositorio Git válido")
+            print(f"   📝 Cambios: {status.get('total_changes', 0)}")
+        else:
+            print(f"   ❌ No es un repositorio Git")
+        
+        return {
+            "success": True,
+            "status": status
+        }
+    
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
 def batch_add_curl_to_php_files(limit: int = 50) -> Dict[str, Any]:
     """
     Procesa múltiples archivos PHP del RAG y genera curl para todos.
@@ -1130,6 +1305,10 @@ TOOL_FUNCTIONS = {
     "validate_contract": validate_contract,
     "check_dod_compliance": check_dod_compliance,
     "run_quality_gates": run_quality_gates,
+    "generate_execution_evidence": generate_execution_evidence,
+    "generate_unified_diff": generate_unified_diff,
+    "create_incremental_commit": create_incremental_commit,
+    "check_git_status": check_git_status,
     "list_files_in_dir": list_files_in_dir,
     "explore_directory": explore_directory,
     "read_file": read_file,
@@ -1275,6 +1454,110 @@ TOOLS = [
                         "description": "Lista de archivos específicos a verificar (null = todos los .py)"
                     }
                 },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_execution_evidence",
+            "description": "📋 Genera evidencia estructurada completa de ejecución de un paso. Incluye gates, DoD, validaciones y métricas en formato estándar.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "step_title": {
+                        "type": "string",
+                        "description": "Título descriptivo del paso ejecutado"
+                    },
+                    "gates_result": {
+                        "type": "object",
+                        "description": "Resultado de quality gates ejecutados"
+                    },
+                    "dod_result": {
+                        "type": "object",
+                        "description": "Resultado de verificación de DoD"
+                    },
+                    "validation_result": {
+                        "type": "object",
+                        "description": "Resultado de validación de contratos"
+                    },
+                    "custom_data": {
+                        "type": "object",
+                        "description": "Datos adicionales personalizados para incluir en la evidencia"
+                    }
+                },
+                "required": ["step_title"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_unified_diff",
+            "description": "📝 Genera unified diff entre contenido original y modificado de un archivo. Útil para documentar cambios exactos con estadísticas.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Ruta del archivo"
+                    },
+                    "original_content": {
+                        "type": "string",
+                        "description": "Contenido original del archivo"
+                    },
+                    "modified_content": {
+                        "type": "string",
+                        "description": "Contenido modificado del archivo"
+                    }
+                },
+                "required": ["file_path", "original_content", "modified_content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_incremental_commit",
+            "description": "💾 Crea un commit incremental siguiendo ModoGorila. Verifica límite ≤200 líneas, genera mensaje estructurado con DoD y evidencia.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "Mensaje base del commit (ej: 'feat: Implementar X', 'fix: Corregir Y')"
+                    },
+                    "files_to_add": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Lista de archivos a agregar al commit (null = todos los modificados)"
+                    },
+                    "include_dod": {
+                        "type": "boolean",
+                        "description": "Si debe incluir DoD en el mensaje del commit (default: true)"
+                    },
+                    "dod_data": {
+                        "type": "object",
+                        "description": "Datos de DoD para incluir en el mensaje"
+                    },
+                    "evidence_data": {
+                        "type": "object",
+                        "description": "Datos de evidencia (gates, validaciones) para incluir"
+                    }
+                },
+                "required": ["message"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_git_status",
+            "description": "📂 Verifica el estado del repositorio Git. Retorna archivos modificados, staged, untracked y estadísticas.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
                 "required": []
             }
         }
