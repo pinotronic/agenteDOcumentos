@@ -6,13 +6,14 @@ import json
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 import hashlib
 
 import chromadb
 from chromadb.config import Settings
+from openai import OpenAI
 
-from config import RAG_STORAGE_PATH
+from config import RAG_STORAGE_PATH, RAG_INDEXER_SYSTEM_PROMPT, ANALYZER_MODEL
 
 
 class RAGStorage:
@@ -30,6 +31,9 @@ class RAGStorage:
         """
         self.storage_path = Path(storage_path)
         self.storage_path.mkdir(exist_ok=True)
+        
+        # Cliente OpenAI para indexación inteligente
+        self.openai_client = OpenAI()
         
         # Usar cliente en memoria (EphemeralClient) para evitar bug de ChromaDB 1.3.6
         # con Python 3.13 en Windows que causa: PanicException "range start index out of range"
@@ -53,11 +57,98 @@ class RAGStorage:
         """Genera un ID único para un archivo basado en su ruta."""
         return hashlib.md5(file_path.encode()).hexdigest()
     
-    def _create_document_text(self, file_path: str, analysis: Dict[str, Any]) -> str:
+    def evaluate_for_indexing(self, file_path: str, content: str, analysis: Dict[str, Any]) -> Tuple[bool, Optional[Dict]]:
+        """
+        Evalúa si un fragmento debe ser indexado usando el agente RAG inteligente.
+        
+        Args:
+            file_path: Ruta del archivo
+            content: Contenido del archivo (fragmento relevante)
+            analysis: Análisis previo del archivo
+            
+        Returns:
+            Tuple (should_index: bool, indexed_data: Dict or None)
+        """
+        # Preparar prompt con contexto
+        user_prompt = f"""
+Archivo: {file_path}
+Tipo: {analysis.get('file_type', 'desconocido')}
+
+CONTENIDO:
+```
+{content[:3000]}  # Limitar a 3000 caracteres
+```
+
+ANÁLISIS PREVIO:
+{json.dumps(analysis, indent=2, ensure_ascii=False)[:2000]}
+
+Evalúa si este fragmento debe indexarse en la base de conocimiento de SIGSAPAL.
+Responde en formato JSON según las instrucciones.
+"""
+        
+        try:
+            response = self.openai_client.chat.completions.create(
+                model=ANALYZER_MODEL,
+                messages=[
+                    {"role": "system", "content": RAG_INDEXER_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.2,
+                response_format={"type": "json_object"}
+            )
+            
+            result = json.loads(response.choices[0].message.content)
+            
+            if result.get("should_index"):
+                print(f"✅ Relevante para indexar: {result.get('title', file_path)}")
+                return True, result
+            else:
+                print(f"⏭️  No indexado: {result.get('reason', 'No relevante')}")
+                return False, None
+                
+        except Exception as e:
+            print(f"⚠️  Error en evaluación de indexación: {e}")
+            # En caso de error, indexar por defecto (comportamiento seguro)
+            return True, None
+    
+    def _create_document_text(self, file_path: str, analysis: Dict[str, Any], indexed_data: Optional[Dict] = None) -> str:
         """
         Crea el texto del documento para embeddings semánticos.
         Combina toda la información relevante para búsqueda.
+        
+        Args:
+            file_path: Ruta del archivo
+            analysis: Análisis completo del archivo
+            indexed_data: Datos de indexación inteligente (si están disponibles)
         """
+        # Si hay datos de indexación inteligente, usarlos primero
+        if indexed_data and indexed_data.get("should_index"):
+            parts = [
+                f"FILE: {Path(file_path).name}",
+                f"PATH: {file_path}",
+                f"TITLE: {indexed_data.get('title', '')}",
+                f"SUMMARY: {indexed_data.get('summary', '')}",
+                f"MODULE: {indexed_data.get('metadata', {}).get('module', '')}",
+                f"TYPE: {indexed_data.get('metadata', {}).get('source_type', '')}",
+            ]
+            
+            # Agregar recursos
+            resources = indexed_data.get('metadata', {}).get('resources', [])
+            if resources:
+                parts.append(f"RESOURCES: {', '.join(resources)}")
+            
+            # Agregar conceptos clave
+            key_concepts = indexed_data.get('key_concepts', [])
+            if key_concepts:
+                parts.append(f"KEY_CONCEPTS: {', '.join(key_concepts)}")
+            
+            # Agregar snippet si existe
+            if indexed_data.get('code_snippet'):
+                parts.append(f"CODE_SNIPPET: {indexed_data['code_snippet'][:500]}")
+                
+            return "\n".join(parts)
+        
+        # Fallback al método anterior si no hay indexación inteligente
         parts = [
             f"FILE: {Path(file_path).name}",
             f"PATH: {file_path}",
@@ -87,7 +178,8 @@ class RAGStorage:
         
         return "\n".join(parts)
     
-    def save_analysis(self, file_path: str, analysis: Dict[str, Any], curl_metadata: Optional[Dict] = None) -> str:
+    def save_analysis(self, file_path: str, analysis: Dict[str, Any], curl_metadata: Optional[Dict] = None, 
+                     content: Optional[str] = None, use_smart_indexing: bool = True) -> Optional[str]:
         """
         Guarda el análisis de un archivo en el RAG con ChromaDB.
         
@@ -95,10 +187,19 @@ class RAGStorage:
             file_path: Ruta del archivo analizado
             analysis: Resultado del análisis (JSON del agente analizador)
             curl_metadata: Metadatos de curl para archivos PHP (opcional)
+            content: Contenido del archivo para evaluación inteligente (opcional)
+            use_smart_indexing: Si True, evalúa antes de guardar (por defecto True)
             
         Returns:
-            ID del documento guardado
+            ID del documento guardado o None si no se indexó
         """
+        # Evaluación inteligente si está habilitada y hay contenido
+        indexed_data = None
+        if use_smart_indexing and content:
+            should_index, indexed_data = self.evaluate_for_indexing(file_path, content, analysis)
+            if not should_index:
+                return None
+        
         doc_id = self._generate_doc_id(file_path)
         
         # Preparar documento completo como metadata
@@ -123,8 +224,19 @@ class RAGStorage:
                 "has_database": str(curl_metadata.get("has_database", False))
             })
         
-        # Crear texto para embedding
-        document_text = self._create_document_text(file_path, analysis)
+        # Agregar datos de indexación inteligente si existen
+        if indexed_data:
+            document_data.update({
+                "indexed_title": indexed_data.get("title", ""),
+                "indexed_summary": indexed_data.get("summary", ""),
+                "sigsapal_module": indexed_data.get("metadata", {}).get("module", ""),
+                "source_type": indexed_data.get("metadata", {}).get("source_type", ""),
+                "resources": json.dumps(indexed_data.get("metadata", {}).get("resources", []), ensure_ascii=False),
+                "key_concepts": json.dumps(indexed_data.get("key_concepts", []), ensure_ascii=False)
+            })
+        
+        # Crear texto para embedding (pasando indexed_data)
+        document_text = self._create_document_text(file_path, analysis, indexed_data)
         
         # Guardar en ChromaDB (upsert para actualizar si existe)
         self.collection.upsert(

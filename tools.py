@@ -186,7 +186,7 @@ def read_file(file_path: str) -> Dict[str, Any]:
 
 def analyze_file(file_path: str) -> Dict[str, Any]:
     """
-    Analiza un archivo usando el LLM analizador y guarda en RAG.
+    Analiza un archivo usando el LLM analizador y guarda en RAG con indexación inteligente.
     
     Args:
         file_path: Ruta del archivo a analizar
@@ -206,8 +206,22 @@ def analyze_file(file_path: str) -> Dict[str, Any]:
         file_type=file_data["type"]
     )
     
-    # Guardar en RAG
-    doc_id = _rag_storage.save_analysis(file_data["file_path"], analysis)
+    # Guardar en RAG con indexación inteligente (pasa el contenido)
+    doc_id = _rag_storage.save_analysis(
+        file_path=file_data["file_path"], 
+        analysis=analysis,
+        content=file_data["content"],  # Pasar contenido para evaluación
+        use_smart_indexing=True  # Habilitar indexación inteligente
+    )
+    
+    # Si doc_id es None, significa que no se indexó
+    if doc_id is None:
+        return {
+            "file_path": file_data["file_path"],
+            "analysis": analysis,
+            "saved_to_rag": False,
+            "reason": "No cumple criterios de relevancia para SIGSAPAL"
+        }
     
     return {
         "file_path": file_data["file_path"],
