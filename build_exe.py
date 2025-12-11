@@ -52,8 +52,12 @@ cmd_base.extend([
     "--hidden-import=chromadb",
     "--hidden-import=openai",
     "--hidden-import=tiktoken",
+    "--hidden-import=onnxruntime",
+    "--hidden-import=tokenizers",
     "--collect-all=chromadb",
     "--collect-all=openai",
+    "--collect-all=onnxruntime",
+    "--collect-all=tokenizers",
 ])
 
 if opcion == "1":
