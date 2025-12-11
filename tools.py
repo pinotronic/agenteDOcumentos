@@ -27,6 +27,8 @@ from contract_validator import ContractValidator, DoDChecker
 from quality_gate import QualityGate
 from evidence_generator import EvidenceGenerator
 from incremental_committer import IncrementalCommitter
+from plan_executor import PlanExecutor, list_directory_recursive
+from plan_supervisor import PlanSupervisor
 
 # Instancias globales
 _rag_storage = RAGStorage()
@@ -45,6 +47,10 @@ _dod_checker = DoDChecker()
 _quality_gate = QualityGate()
 _evidence_generator = EvidenceGenerator()
 _incremental_committer = IncrementalCommitter()
+
+# Executor y Supervisor se inicializarán después de registrar tools
+_plan_executor = None
+_plan_supervisor = None
 
 
 def _should_ignore(path: Path) -> bool:
@@ -1299,6 +1305,60 @@ def batch_add_curl_to_php_files(limit: int = 50) -> Dict[str, Any]:
         }
 
 
+def list_directory_recursive_wrapper(
+    directory_path: str,
+    extensions: List[str] = None,
+    max_depth: int = None,
+    include_hidden: bool = False
+) -> Dict[str, Any]:
+    """
+    [PLAN EXECUTOR] Lista TODOS los archivos en un directorio recursivamente.
+    Sin límites artificiales, filtra por extensión si se necesita.
+    """
+    return list_directory_recursive(
+        directory_path=directory_path,
+        extensions=extensions,
+        max_depth=max_depth,
+        include_hidden=include_hidden
+    )
+
+
+def execute_plan(plan: Dict[str, Any], context: Dict[str, Any] = None) -> Dict[str, Any]:
+    """
+    [PLAN EXECUTOR] Ejecuta un plan generado por el Architect paso a paso.
+    Registra evidencia y maneja errores con reintentos.
+    """
+    global _plan_executor
+    
+    # Inicializar executor si no existe
+    if _plan_executor is None:
+        _plan_executor = PlanExecutor(TOOL_FUNCTIONS)
+    
+    return _plan_executor.execute_plan(plan, context)
+
+
+def supervise_plan_execution(
+    plan: Dict[str, Any],
+    context: Dict[str, Any] = None
+) -> Dict[str, Any]:
+    """
+    [SUPERVISOR] Ejecuta y valida un plan completo con reintentos inteligentes.
+    El supervisor LLM verifica cumplimiento de DoD y decide si reintentar o escalar.
+    """
+    global _plan_executor, _plan_supervisor
+    
+    # Inicializar si no existen
+    if _plan_executor is None:
+        _plan_executor = PlanExecutor(TOOL_FUNCTIONS)
+    
+    if _plan_supervisor is None:
+        from openai import OpenAI
+        client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        _plan_supervisor = PlanSupervisor(client)
+    
+    return _plan_supervisor.supervise_plan_execution(plan, _plan_executor, context)
+
+
 # Registro de funciones disponibles
 TOOL_FUNCTIONS = {
     "generate_analysis_plan": generate_analysis_plan,
@@ -1309,6 +1369,9 @@ TOOL_FUNCTIONS = {
     "generate_unified_diff": generate_unified_diff,
     "create_incremental_commit": create_incremental_commit,
     "check_git_status": check_git_status,
+    "list_directory_recursive": list_directory_recursive_wrapper,
+    "execute_plan": execute_plan,
+    "supervise_plan_execution": supervise_plan_execution,
     "list_files_in_dir": list_files_in_dir,
     "explore_directory": explore_directory,
     "read_file": read_file,
@@ -1559,6 +1622,78 @@ TOOLS = [
                 "type": "object",
                 "properties": {},
                 "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_directory_recursive",
+            "description": "📂 [ESCANEO RECURSIVO] Lista TODOS los archivos en un directorio y subdirectorios. Filtra por extensión (ej: ['.php', '.py']). Retorna árbol completo con estadísticas. Perfecto para descubrir archivos que explore_directory no detectó.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "directory_path": {
+                        "type": "string",
+                        "description": "Ruta del directorio a escanear recursivamente"
+                    },
+                    "extensions": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Lista de extensiones a filtrar (ej: ['.php', '.py', '.js']). null = todos los archivos"
+                    },
+                    "max_depth": {
+                        "type": "integer",
+                        "description": "Profundidad máxima (null = sin límite, recomendado)"
+                    },
+                    "include_hidden": {
+                        "type": "boolean",
+                        "description": "Incluir archivos/carpetas ocultos (default: false)"
+                    }
+                },
+                "required": ["directory_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "execute_plan",
+            "description": "⚙️ [EJECUTOR] Ejecuta un plan generado por generate_analysis_plan paso a paso. Registra evidencia, maneja errores con reintentos automáticos (max 2).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "plan": {
+                        "type": "object",
+                        "description": "Plan completo del Architect con execution_steps"
+                    },
+                    "context": {
+                        "type": "object",
+                        "description": "Contexto adicional (rutas, parámetros) para sustituir variables ${var}"
+                    }
+                },
+                "required": ["plan"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "supervise_plan_execution",
+            "description": "👁️ [SUPERVISOR] Ejecuta y valida un plan completo con LLM supervisor. Verifica DoD, detecta problemas, reintenta automáticamente si es posible, o escala al usuario si falla. USA ESTA HERRAMIENTA después de generate_analysis_plan para ejecutar y validar.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "plan": {
+                        "type": "object",
+                        "description": "Plan completo del Architect con execution_steps y DoD"
+                    },
+                    "context": {
+                        "type": "object",
+                        "description": "Contexto adicional (rutas, parámetros)"
+                    }
+                },
+                "required": ["plan"]
             }
         }
     },
