@@ -10,7 +10,7 @@ from datetime import datetime
 
 from config import (
     ALL_EXTENSIONS, IGNORE_PATTERNS, BINARY_EXTENSIONS,
-    MAX_FILE_SIZE_MB, SHOW_PERMISSION_WARNINGS
+    MAX_FILE_SIZE_MB, SHOW_PERMISSION_WARNINGS, CODE_EXTENSIONS
 )
 from rag_storage_chroma import RAGStorage  # ChromaDB en lugar de JSON
 from code_analyzer import CodeAnalyzer
@@ -23,6 +23,8 @@ from report_generator import ReportGenerator
 from ci_cd_tools import CICDTools
 from php_curl_analyzer import PHPCurlAnalyzer
 from architect_mode import Architect
+from contract_validator import ContractValidator, DoDChecker
+from quality_gate import QualityGate
 
 # Instancias globales
 _rag_storage = RAGStorage()
@@ -36,6 +38,9 @@ _report_generator = ReportGenerator(rag_storage=_rag_storage)  # Compartir insta
 _ci_cd_tools = CICDTools()
 _php_curl_analyzer = PHPCurlAnalyzer(base_url="http://172.16.12.178")
 _architect = Architect()
+_contract_validator = ContractValidator()
+_dod_checker = DoDChecker()
+_quality_gate = QualityGate()
 
 
 def _should_ignore(path: Path) -> bool:
@@ -936,6 +941,134 @@ def generate_analysis_plan(
         }
 
 
+def validate_contract(
+    data: Dict[str, Any],
+    schema_name: str = None,
+    custom_schema: Dict = None
+) -> Dict[str, Any]:
+    """
+    Valida un output contra un JSON Schema.
+    Verifica que los datos cumplan con el contrato especificado.
+    
+    Args:
+        data: Datos a validar
+        schema_name: Nombre del schema predefinido (analysis_result, exploration_result, plan_result)
+        custom_schema: Schema personalizado en formato JSON Schema
+    
+    Returns:
+        Resultado de validación con errores si los hay
+    """
+    print(f"\n📋 [CONTRACT] Validando contra schema: {schema_name or 'custom'}...")
+    
+    try:
+        result = _contract_validator.validate_output(
+            data=data,
+            schema_name=schema_name,
+            custom_schema=custom_schema
+        )
+        
+        if result["valid"]:
+            print(f"   ✅ Validación exitosa")
+        else:
+            print(f"   ❌ Validación falló: {result.get('error')}")
+        
+        return {
+            "success": True,
+            "validation": result
+        }
+    
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+def check_dod_compliance(
+    dod: Dict[str, Any],
+    execution_evidence: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Verifica cumplimiento de Definition of Done.
+    Valida que se cumplan todos los criterios de aceptación.
+    
+    Args:
+        dod: Definition of Done del plan (con checklist, criteria, metrics)
+        execution_evidence: Evidencia de ejecución con resultados y métricas
+    
+    Returns:
+        Reporte de cumplimiento con gaps y score
+    """
+    print(f"\n✅ [DoD] Verificando cumplimiento...")
+    
+    try:
+        result = _dod_checker.check_dod(
+            dod=dod,
+            execution_evidence=execution_evidence
+        )
+        
+        return {
+            "success": True,
+            "compliance": result,
+            "dod_satisfied": result["dod_satisfied"],
+            "score": result["score"]
+        }
+    
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+def run_quality_gates(
+    check_build: bool = True,
+    check_lint: bool = True,
+    check_tests: bool = False,
+    files_to_check: List[str] = None
+) -> Dict[str, Any]:
+    """
+    Ejecuta gates de calidad: compilación, lint, tests.
+    Self-check obligatorio antes de continuar.
+    
+    Args:
+        check_build: Si debe verificar sintaxis/compilación
+        check_lint: Si debe ejecutar linters
+        check_tests: Si debe ejecutar tests
+        files_to_check: Lista de archivos específicos (None = todos)
+    
+    Returns:
+        Resultado de gates con evidencia de cada verificación
+    """
+    print(f"\n🚦 [QUALITY GATES] Ejecutando verificaciones...")
+    
+    try:
+        result = _quality_gate.run_all_gates(
+            check_build=check_build,
+            check_lint=check_lint,
+            check_tests=check_tests,
+            files_to_check=files_to_check
+        )
+        
+        # Generar evidencia estructurada
+        evidence = _quality_gate.generate_evidence(result)
+        
+        return {
+            "success": True,
+            "gates_passed": result["gates_passed"],
+            "gates": result["gates"],
+            "evidence": evidence,
+            "message": "Verificaciones completadas"
+        }
+    
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "message": "Error ejecutando quality gates"
+        }
+
+
 def batch_add_curl_to_php_files(limit: int = 50) -> Dict[str, Any]:
     """
     Procesa múltiples archivos PHP del RAG y genera curl para todos.
@@ -994,6 +1127,9 @@ def batch_add_curl_to_php_files(limit: int = 50) -> Dict[str, Any]:
 # Registro de funciones disponibles
 TOOL_FUNCTIONS = {
     "generate_analysis_plan": generate_analysis_plan,
+    "validate_contract": validate_contract,
+    "check_dod_compliance": check_dod_compliance,
+    "run_quality_gates": run_quality_gates,
     "list_files_in_dir": list_files_in_dir,
     "explore_directory": explore_directory,
     "read_file": read_file,
@@ -1063,6 +1199,83 @@ TOOLS = [
                     }
                 },
                 "required": ["repository_path", "user_requirements"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "validate_contract",
+            "description": "📋 Valida un output contra un JSON Schema. Verifica que los datos cumplan con el contrato especificado (schemas predefinidos: analysis_result, exploration_result, plan_result).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "data": {
+                        "type": "object",
+                        "description": "Datos a validar (objeto JSON)"
+                    },
+                    "schema_name": {
+                        "type": "string",
+                        "enum": ["analysis_result", "exploration_result", "plan_result"],
+                        "description": "Nombre del schema predefinido a usar"
+                    },
+                    "custom_schema": {
+                        "type": "object",
+                        "description": "Schema personalizado en formato JSON Schema (si no se usa schema predefinido)"
+                    }
+                },
+                "required": ["data"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_dod_compliance",
+            "description": "✅ Verifica cumplimiento de Definition of Done. Valida que se cumplan criterios de aceptación, checklist y métricas del plan.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "dod": {
+                        "type": "object",
+                        "description": "Definition of Done del plan (debe incluir: checklist, acceptance_criteria, metrics)"
+                    },
+                    "execution_evidence": {
+                        "type": "object",
+                        "description": "Evidencia de ejecución con resultados, stats, métricas alcanzadas"
+                    }
+                },
+                "required": ["dod", "execution_evidence"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_quality_gates",
+            "description": "🚦 Ejecuta gates de calidad: sintaxis/compilación, linters, tests. Self-check obligatorio antes de continuar con siguiente paso.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "check_build": {
+                        "type": "boolean",
+                        "description": "Si debe verificar sintaxis/compilación (default: true)"
+                    },
+                    "check_lint": {
+                        "type": "boolean",
+                        "description": "Si debe ejecutar linters (default: true)"
+                    },
+                    "check_tests": {
+                        "type": "boolean",
+                        "description": "Si debe ejecutar tests (default: false, ya que puede ser lento)"
+                    },
+                    "files_to_check": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Lista de archivos específicos a verificar (null = todos los .py)"
+                    }
+                },
+                "required": []
             }
         }
     },
