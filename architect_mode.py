@@ -96,6 +96,58 @@ class Architect:
 - quick: Análisis rápido de estructura y archivos principales
 - targeted: Análisis enfocado en archivos/módulos específicos
 
+**HERRAMIENTAS DISPONIBLES PARA LOS PASOS:**
+IMPORTANTE: Usa SOLO estos nombres exactos de herramientas en "tool" de execution_steps:
+
+📂 EXPLORACIÓN Y ESCANEO:
+- list_directory_recursive: Escaneo recursivo exhaustivo con filtro por extensión
+- explore_directory: Análisis arquitectónico sin límites (frameworks, dependencias)
+- list_files_in_dir: Listado simple de directorio (no recursivo)
+
+📖 LECTURA Y ANÁLISIS:
+- read_file: Lee contenido de archivo específico
+- analyze_file: Analiza archivo individual y guarda en RAG
+- analyze_directory: Analiza directorio completo y guarda en RAG
+- search_in_rag: Busca en documentos ya analizados
+
+📊 DEPENDENCIAS Y SEGURIDAD:
+- check_dependencies: Verifica dependencias del proyecto
+- security_audit: Auditoría de seguridad
+- generate_dependency_graph: Genera grafo de dependencias
+
+📝 DOCUMENTACIÓN Y REPORTES:
+- generate_documentation: Genera docs técnicas
+- generate_html_dashboard: Dashboard HTML interactivo
+- technical_debt_report: Reporte de deuda técnica
+
+**EJEMPLOS DE STEPS VÁLIDOS:**
+{{
+  "step_number": 1,
+  "action": "Escanear archivos PHP recursivamente",
+  "objective": "Detectar TODOS los archivos .php en carpetas y subcarpetas",
+  "tool": "list_directory_recursive",  // ← Nombre EXACTO
+  "parameters": {{
+    "directory_path": "${{repository_path}}",
+    "extensions": [".php"],
+    "max_depth": null  // Sin límites
+  }},
+  "critical": true
+}}
+
+{{
+  "step_number": 2,
+  "action": "Analizar arquitectura del proyecto",
+  "objective": "Detectar frameworks, entry points, dependencias",
+  "tool": "explore_directory",  // ← Nombre EXACTO
+  "parameters": {{
+    "directory": "${{repository_path}}",
+    "recursive": true,
+    "max_depth": null,
+    "analyze_architecture": true
+  }},
+  "critical": true
+}}
+
 **DEBES GENERAR UN PLAN ESTRUCTURADO CON:**
 
 1. **Spec Pack (Especificación):**
@@ -164,8 +216,14 @@ Usa esta estructura exacta:
   "execution_steps": [
     {{
       "step_number": 1,
-      "title": "Título del paso",
-      "description": "Qué hacer en este paso",
+      "action": "Acción específica a realizar",
+      "objective": "Qué se busca lograr",
+      "tool": "nombre_exacto_herramienta",
+      "parameters": {{
+        "param1": "valor o ${{variable}}",
+        "param2": "valor"
+      }},
+      "critical": true,
       "estimated_files": 10,
       "estimated_time": "5 min",
       "dependencies": [],
@@ -233,8 +291,11 @@ Genera planes detallados, accionables y verificables."""
             steps = plan["execution_steps"]
             print(f"\n📝 PASOS DE EJECUCIÓN: {len(steps)} pasos")
             for step in steps[:3]:  # Mostrar primeros 3
-                print(f"   {step['step_number']}. {step['title']}")
-                print(f"      └─ Archivos: ~{step.get('estimated_files', '?')}, "
+                title = step.get("action") or step.get("title", "Sin título")
+                tool = step.get("tool", "N/A")
+                print(f"   {step['step_number']}. {title}")
+                print(f"      └─ Tool: {tool}, "
+                      f"Archivos: ~{step.get('estimated_files', '?')}, "
                       f"Tiempo: {step.get('estimated_time', '?')}")
             if len(steps) > 3:
                 print(f"   ... y {len(steps) - 3} pasos más")
