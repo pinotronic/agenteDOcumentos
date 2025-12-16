@@ -80,6 +80,15 @@ Proporciona un análisis completo en formato JSON siguiendo la estructura especi
             analysis_text = response.choices[0].message.content
             analysis = json.loads(analysis_text)
             
+            # Normalizar relaciones para grafo entre archivos/sistemas
+            analysis.setdefault("relationships", {
+                "intra_repo_dependencies": [],
+                "cross_service_calls": [],
+                "datastores": [],
+                "events_or_queues": [],
+                "exposed_endpoints": []
+            })
+            
             # Agregar metadata adicional
             analysis["file_path"] = file_path
             analysis["tokens_analyzed"] = tokens

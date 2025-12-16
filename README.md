@@ -476,3 +476,14 @@ Este es un sistema modular diseñado para extensión:
 MIT License - Libre para uso personal y comercial
 
 activar el ambiente virtual: .\env\Scripts\Activate.ps1
+
+```bash
+   .\env\Scripts\python.exe main.py
+   .\env\Scripts\activate.bat
+```
+
+
+## Contexto relacional y persistencia RAG
+- Cada analisis ahora incluye `relationships` (dependencias internas, llamadas a servicios, datastores, colas/eventos, endpoints expuestos).
+- Nueva herramienta `get_relationship_graph`: devuelve nodos/edges para ver cómo se conectan archivos, servicios y datos.
+- ChromaDB puede operar en modo persistente: usa `CHROMA_PERSIST=1` y `CHROMA_PERSIST_PATH` (fallback automático a memoria si hay incompatibilidad en Windows/Python 3.13).

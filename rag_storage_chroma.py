@@ -3,6 +3,7 @@ Sistema de almacenamiento RAG con ChromaDB (Vectorial + Rápido).
 Reemplazo del sistema JSON por base de datos vectorial para búsquedas semánticas ultra-rápidas.
 """
 import json
+import os
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -32,20 +33,29 @@ class RAGStorage:
         self.storage_path = Path(storage_path)
         self.storage_path.mkdir(exist_ok=True)
         
-        # Cliente OpenAI para indexación inteligente
+                # Cliente OpenAI para indexaci¢n inteligente
         self.openai_client = OpenAI()
-        
-        # Usar cliente en memoria (EphemeralClient) para evitar bug de ChromaDB 1.3.6
-        # con Python 3.13 en Windows que causa: PanicException "range start index out of range"
-        print("ℹ️  Usando ChromaDB en modo memoria (compatible con Python 3.13)")
-        self.client = chromadb.EphemeralClient(
-            settings=Settings(
-                anonymized_telemetry=False,
-                allow_reset=True
-            )
-        )
-        
-        # Crear o obtener colección
+
+        # Inicializar cliente Chroma con persistencia opcional y fallback seguro
+        client_settings = Settings(anonymized_telemetry=False, allow_reset=True)
+        persist_flag = os.environ.get("CHROMA_PERSIST", "1").lower() not in {"0", "false", "no"}
+        persist_path = os.environ.get("CHROMA_PERSIST_PATH", str(self.storage_path))
+        self.storage_mode = "ephemeral"
+
+        if persist_flag:
+            try:
+                self.client = chromadb.PersistentClient(path=persist_path, settings=client_settings)
+                self.storage_mode = f"persistent:{persist_path}"
+                print(f"? Usando ChromaDB persistente en {persist_path}")
+            except Exception as e:
+                # Fallback a memoria para compatibilidad (bug Chroma 1.3.6 en Win+Python 3.13)
+                print(f"??  No se pudo iniciar Chroma persistente ({e}); usando modo memoria compatible")
+                self.client = chromadb.EphemeralClient(settings=client_settings)
+        else:
+            print("??  CHROMA_PERSIST desactivado: modo memoria")
+            self.client = chromadb.EphemeralClient(settings=client_settings)
+
+# Crear o obtener colección
         self.collection = self.client.get_or_create_collection(
             name="code_analysis",
             metadata={"description": "Análisis de código con embeddings semánticos"}
@@ -176,6 +186,23 @@ Responde en formato JSON según las instrucciones.
         if analysis.get('key_features'):
             parts.append(f"FEATURES: {', '.join(analysis['key_features'][:10])}")
         
+        # Incluir relaciones para consultas semanticas (dependencias, servicios, datos)
+        relationships = analysis.get("relationships", {})
+        if relationships:
+            deps = relationships.get("intra_repo_dependencies") or []
+            if deps:
+                parts.append(f"REL_DEPENDS_ON: {', '.join(deps[:10])}")
+            for call in (relationships.get("cross_service_calls") or [])[:10]:
+                target = call.get("target", "external")
+                desc = call.get("description", "")
+                parts.append(f"REL_CALLS: {call.get('type', 'svc')} -> {target} {desc}")
+            for ds in (relationships.get("datastores") or [])[:10]:
+                parts.append(f"REL_DATASTORE: {ds.get('engine', '')} {ds.get('resource', '')} {ds.get('action', '')}")
+            for ev in (relationships.get("events_or_queues") or [])[:10]:
+                parts.append(f"REL_EVENT: {ev.get('bus', '')}:{ev.get('topic', '')} {ev.get('direction', '')}")
+            for ep in (relationships.get("exposed_endpoints") or [])[:10]:
+                parts.append(f"REL_EXPOSES: {ep.get('route', '')} {ep.get('method', '')}")
+
         return "\n".join(parts)
     
     def save_analysis(self, file_path: str, analysis: Dict[str, Any], curl_metadata: Optional[Dict] = None, 
@@ -211,7 +238,12 @@ Responde en formato JSON según las instrucciones.
             "analysis_json": json.dumps(analysis, ensure_ascii=False)
         }
         
-        # Agregar metadatos de curl si existen (para archivos PHP)
+                # Guardar relaciones entre archivos/servicios si existen
+        relationships = analysis.get("relationships") or {}
+        if relationships:
+            document_data["relationships_json"] = json.dumps(relationships, ensure_ascii=False)
+        
+# Agregar metadatos de curl si existen (para archivos PHP)
         if curl_metadata:
             document_data.update({
                 "curl_command": curl_metadata.get("curl_command", ""),
@@ -403,6 +435,117 @@ Responde en formato JSON según las instrucciones.
         results.sort(key=lambda x: x.get("relevance", 0.0), reverse=True)
         return results[:20]
     
+    def get_relationship_graph(self, file_filter: Optional[str] = None, include_external: bool = True) -> Dict[str, Any]:
+        """
+        Construye un grafo ligero de relaciones entre archivos, servicios y datos.
+
+        Args:
+            file_filter: Substring para filtrar rutas (ej: carpeta o extension)
+            include_external: Si incluye nodos externos (servicios/colas)
+        """
+        try:
+            results = self.collection.get(include=["metadatas"])
+        except Exception as e:
+            return {"success": False, "error": f"Error obteniendo metadatos: {e}"}
+
+        nodes: Dict[str, Dict[str, Any]] = {}
+        edges: List[Dict[str, Any]] = []
+        seen_edges = set()
+
+        def add_node(node_id: str, label: str, kind: str):
+            if not node_id:
+                return
+            if file_filter and node_id and file_filter.lower() not in node_id.lower():
+                return
+            if node_id not in nodes:
+                nodes[node_id] = {"id": node_id, "label": label or node_id, "type": kind}
+
+        for metadata in results.get("metadatas", []):
+            src = metadata.get("file_path")
+            if not src:
+                continue
+            if file_filter and file_filter.lower() not in src.lower():
+                continue
+            add_node(src, metadata.get("file_name", src), "file")
+
+            relationships = None
+            rel_json = metadata.get("relationships_json")
+            if rel_json:
+                try:
+                    relationships = json.loads(rel_json)
+                except Exception:
+                    relationships = None
+            if relationships is None:
+                try:
+                    relationships = json.loads(metadata.get("analysis_json", "{}"))
+                except Exception:
+                    relationships = {}
+                else:
+                    relationships = relationships.get("relationships", {}) if isinstance(relationships, dict) else {}
+
+            if not relationships:
+                continue
+
+            # Dependencias internas (por nombre de modulo/ruta)
+            for dep in relationships.get("intra_repo_dependencies", []) or []:
+                target = dep.strip()
+                add_node(target, target, "module")
+                edge_key = (src, target, "depends_on")
+                if edge_key not in seen_edges:
+                    edges.append({"from": src, "to": target, "type": "depends_on"})
+                    seen_edges.add(edge_key)
+
+            # Servicios externos
+            if include_external:
+                for call in relationships.get("cross_service_calls", []) or []:
+                    target = call.get("target") or call.get("host") or "external_service"
+                    target = target.strip()
+                    add_node(target, target, "service")
+                    edge_key = (src, target, "calls_service")
+                    if edge_key not in seen_edges:
+                        edges.append({"from": src, "to": target, "type": "calls_service", "method": call.get("method")})
+                        seen_edges.add(edge_key)
+
+            # Data stores
+            for ds in relationships.get("datastores", []) or []:
+                target = ds.get("resource") or ds.get("engine") or "datastore"
+                target = target.strip()
+                label = f"{ds.get('engine', '')} {target}".strip()
+                add_node(target, label, "datastore")
+                edge_key = (src, target, "uses_datastore")
+                if edge_key not in seen_edges:
+                    edges.append({"from": src, "to": target, "type": "uses_datastore", "action": ds.get("action")})
+                    seen_edges.add(edge_key)
+
+            # Eventos/colas
+            if include_external:
+                for ev in relationships.get("events_or_queues", []) or []:
+                    target = ev.get("topic") or ev.get("bus") or "event_bus"
+                    target = target.strip()
+                    add_node(target, target, "event")
+                    edge_key = (src, target, ev.get("direction", "event"))
+                    if edge_key not in seen_edges:
+                        edges.append({"from": src, "to": target, "type": ev.get("direction", "event")})
+                        seen_edges.add(edge_key)
+
+            # Endpoints expuestos
+            for ep in relationships.get("exposed_endpoints", []) or []:
+                route = ep.get("route") or "endpoint"
+                node_id = f"{src}:{route}"
+                add_node(node_id, route, "endpoint")
+                edge_key = (src, node_id, "exposes")
+                if edge_key not in seen_edges:
+                    edges.append({"from": src, "to": node_id, "type": "exposes", "method": ep.get("method")})
+                    seen_edges.add(edge_key)
+
+        return {
+            "success": True,
+            "nodes": list(nodes.values()),
+            "edges": edges,
+            "stats": {"nodes": len(nodes), "edges": len(edges)},
+            "storage_mode": getattr(self, "storage_mode", "ephemeral")
+        }
+
     def get_statistics(self) -> Dict[str, Any]:
         """
         Obtiene estadísticas del RAG.
@@ -424,7 +567,8 @@ Responde en formato JSON según las instrucciones.
             "total_documents": total_docs,
             "by_type": types_count,
             "storage_type": "ChromaDB (Vectorial)",
-            "search_type": "Semantic Search with Embeddings"
+            "search_type": "Semantic Search with Embeddings",
+            "storage_mode": getattr(self, "storage_mode", "ephemeral")
         }
     
     def update_document_metadata(self, file_path: str, new_metadata: Dict[str, Any]) -> bool:

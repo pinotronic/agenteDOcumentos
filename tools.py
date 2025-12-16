@@ -395,9 +395,12 @@ def analyze_directory(directory: str, file_extensions: List[str] = None) -> Dict
                 "error": result["error"]
             })
         else:
+            doc_id = result.get("document_id")
             results["analyzed"].append({
                 "file": file_info["path"],
-                "document_id": result["document_id"]
+                "document_id": doc_id,
+                "saved_to_rag": result.get("saved_to_rag", bool(doc_id)),
+                "reason": result.get("reason")
             })
     
     print(f"\n✅ Análisis completado: {len(results['analyzed'])} exitosos, {len(results['errors'])} errores")
@@ -440,6 +443,12 @@ def get_rag_statistics() -> Dict[str, Any]:
     """Obtiene estadísticas del RAG."""
     print("⚙️ Obteniendo estadísticas del RAG")
     return _rag_storage.get_statistics()
+
+
+def get_relationship_graph(scope: str = None, include_external: bool = True) -> Dict[str, Any]:
+    """Construye un grafo ligero de relaciones entre archivos/servicios/datos desde el RAG."""
+    print(f"?? Construyendo grafo de relaciones (scope={scope})")
+    return _rag_storage.get_relationship_graph(file_filter=scope, include_external=include_external)
 
 
 def list_files_in_dir(directory: str = ".") -> Dict[str, Any]:
@@ -1379,6 +1388,7 @@ TOOL_FUNCTIONS = {
     "analyze_directory": analyze_directory,
     "search_in_rag": search_in_rag,
     "get_rag_statistics": get_rag_statistics,
+    "get_relationship_graph": get_relationship_graph,
     "create_file": create_file,
     "write_file": write_file,
     "append_to_file": append_to_file,
@@ -1812,6 +1822,27 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_relationship_graph",
+            "description": "Devuelve un grafo ligero con relaciones entre archivos, servicios y datos desde el RAG.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "description": "Filtro opcional por substring de ruta (carpeta o extension)."
+                    },
+                    "include_external": {
+                        "type": "boolean",
+                        "description": "Incluir servicios externos/eventos (default: true)."
+                    }
+                },
                 "required": []
             }
         }

@@ -292,19 +292,20 @@ IMPORTANTE:
 - Enfócate en el conocimiento técnico útil para entender
 """
 
-ANALYZER_SYSTEM_PROMPT = """Eres un agente analizador experto en múltiples lenguajes de programación.
-Tu rol es analizar archivos de código y documentación en profundidad.
+ANALYZER_SYSTEM_PROMPT = """Eres un agente analizador experto en m£ltiples lenguajes de programaci¢n.
+Tu rol es analizar archivos de c¢digo y documentaci¢n en profundidad usando LLM.
 
 Para cada archivo, debes extraer:
-1. **Resumen general**: Propósito y funcionalidad del archivo
+1. **Resumen general**: Prop¢sito y funcionalidad del archivo
 2. **Imports/Dependencias**: Todos los imports y dependencias externas
-3. **Clases**: Nombre, herencia, docstring, métodos públicos
-4. **Funciones**: Firma completa, parámetros, tipo de retorno, docstring
+3. **Clases**: Nombre, herencia, docstring, m‚todos p£blicos
+4. **Funciones**: Firma completa, parmetros, tipo de retorno, docstring
 5. **Constantes/Variables globales**: Nombres y valores si son relevantes
 6. **Contratos**: Interfaces, protocolos, tipos definidos
-7. **Complejidad**: Estimación (baja/media/alta)
+7. **Complejidad**: Estimaci¢n (baja/media/alta)
+8. **Relaciones y comunicaciones**: Usa tu capacidad de LLM para inferir c¢mo este archivo se conecta con otros (del mismo repo o externos)
 
-IMPORTANTE: Responde SIEMPRE en formato JSON válido con esta estructura:
+IMPORTANTE: Responde SIEMPRE en formato JSON vlido con esta estructura:
 {
   "summary": "Resumen del archivo...",
   "file_type": "python/javascript/etc",
@@ -313,7 +314,7 @@ IMPORTANTE: Responde SIEMPRE en formato JSON válido con esta estructura:
     {
       "name": "NombreClase",
       "bases": ["BaseClass1"],
-      "docstring": "Documentación...",
+      "docstring": "Documentaci¢n...",
       "methods": [
         {
           "name": "metodo",
@@ -333,14 +334,30 @@ IMPORTANTE: Responde SIEMPRE en formato JSON válido con esta estructura:
         {"name": "param2", "type": "str", "default": "'default'"}
       ],
       "return_type": "dict",
-      "docstring": "Descripción de la función..."
+      "docstring": "Descripci¢n de la funci¢n..."
     }
   ],
   "constants": [
     {"name": "CONSTANT_NAME", "value": "valor", "type": "str"}
   ],
   "complexity": "low|medium|high",
-  "key_features": ["feature1", "feature2"]
+  "key_features": ["feature1", "feature2"],
+  "relationships": {
+    "intra_repo_dependencies": ["modulos o rutas importadas o referenciadas"],
+    "cross_service_calls": [
+      {"type": "http|grpc|socket", "target": "https://api.svc/endpoint o host", "method": "GET/POST/etc", "description": "qu hace y parmetros clave"}
+    ],
+    "datastores": [
+      {"engine": "postgres|mysql|mongo|redis", "resource": "tabla|colecci¢n|clave", "action": "read|write|migrate", "description": "c¢mo se usa"}
+    ],
+    "events_or_queues": [
+      {"bus": "kafka|sqs|pubsub", "topic": "nombre o routingKey", "direction": "produce|consume", "description": "evento/comando"}
+    ],
+    "exposed_endpoints": [
+      {"type": "http|cli|rpc", "route": "/path o nombre", "method": "GET/POST/etc", "auth": "si/no", "description": "qu expone"}
+    ]
+  }
 }
 
-Si el archivo no es código, adapta la estructura según el tipo de contenido."""
+Si el archivo no es c¢digo, adapta la estructura seg£n el tipo de contenido.
+Si alguna secci¢n no aplica, retorna listas vacas pero conserva el campo 'relationships'."""
