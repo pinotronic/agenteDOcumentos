@@ -32,23 +32,13 @@ class Agent:
         self.memory = ConversationMemory(user_id=user_id)
         self.session_id = self.memory._get_or_create_session()
         
-        # Obtener contexto de conversaciones previas
-        context = self.memory.get_recent_context(limit=5)
-        facts = self.memory.get_facts_summary()
-        
-        # Construir prompt del sistema con contexto
+        # NO agregar contexto previo al inicio para ahorrar tokens
+        # El usuario puede solicitar contexto explícitamente si lo necesita
         base_prompt = system_prompt or ORCHESTRATOR_SYSTEM_PROMPT
-        full_prompt = base_prompt
         
-        if facts:
-            full_prompt += f"\n\n{facts}"
-        
-        if context and "Sin conversaciones previas" not in context:
-            full_prompt += f"\n\n{context}"
-        
-        # Inicializar historial de mensajes con prompt especializado
+        # Inicializar historial de mensajes con prompt compacto
         self.messages = [
-            {"role": "system", "content": full_prompt}
+            {"role": "system", "content": base_prompt}
         ]
     
     def add_user_message(self, content):
@@ -58,31 +48,11 @@ class Agent:
     def _inject_recent_memory(self):
         """
         Inyecta memoria reciente en el contexto antes de cada solicitud.
-        Actualiza el prompt del sistema con los últimos mensajes guardados.
+        DESACTIVADO TEMPORALMENTE para ahorrar tokens.
         """
-        # Obtener contexto actualizado (últimos 5 mensajes de la sesión)
-        context = self.memory.get_recent_context(limit=5, session_id=self.session_id)
-        
-        # Debug: verificar qué se está recuperando
-        print(f"🧠 [DEBUG] Recuperando memoria de sesión: {self.session_id}")
-        print(f"🧠 [DEBUG] Contexto obtenido: {context[:100] if context else 'VACÍO'}...")
-        
-        # Si hay contexto relevante y no está vacío
-        if context and "Sin conversaciones previas" not in context and "Sin mensajes" not in context:
-            # Verificar si el primer mensaje es el system prompt
-            if self.messages and isinstance(self.messages[0], dict) and self.messages[0].get("role") == "system":
-                base_prompt = self.messages[0]["content"]
-                
-                # Remover contexto viejo si existe
-                if "📜 CONTEXTO DE CONVERSACIÓN RECIENTE:" in base_prompt:
-                    base_prompt = base_prompt.split("📜 CONTEXTO DE CONVERSACIÓN RECIENTE:")[0].rstrip()
-                
-                # Agregar contexto actualizado
-                updated_prompt = f"{base_prompt}\n\n{context}"
-                self.messages[0]["content"] = updated_prompt
-                print(f"✅ [DEBUG] Memoria inyectada en el prompt del sistema")
-        else:
-            print(f"⚠️  [DEBUG] No hay contexto para inyectar: {context}")
+        # Desactivado: la memoria consume demasiados tokens
+        # Si el usuario necesita contexto, puede pedirlo explícitamente
+        pass
     
     def get_completion(self, force_reasoning=False, user_query=None):
         """
@@ -184,21 +154,30 @@ class Agent:
             for tool_call in assistant_message.tool_calls:
                 fn_result = self.execute_tool_call(tool_call)
                 
-                # Limitar tamaño de respuesta para no exceder límites de contexto
+                # Limitar tamaño de respuesta AGRESIVAMENTE para no exceder límites de contexto
                 result_str = json.dumps(fn_result, ensure_ascii=False)
-                if len(result_str) > 50000:  # ~12k tokens
-                    # Si es muy grande, resumir
+                max_result_chars = 10000  # ~2.5K tokens máximo por resultado
+                
+                if len(result_str) > max_result_chars:
+                    # Si es muy grande, resumir agresivamente
                     if isinstance(fn_result, dict):
-                        # Mantener estructura pero limitar arrays
+                        # Mantener estructura pero limitar arrays drasticamente
                         limited_result = {}
                         for key, value in fn_result.items():
-                            if isinstance(value, list) and len(value) > 10:
-                                limited_result[key] = value[:10] + [f"... (y {len(value) - 10} más)"]
+                            if isinstance(value, list):
+                                # Solo primeros 3 elementos
+                                if len(value) > 3:
+                                    limited_result[key] = value[:3] + [f"[... {len(value) - 3} elementos más truncados]"]
+                                else:
+                                    limited_result[key] = value
+                            elif isinstance(value, str) and len(value) > 500:
+                                # Truncar strings largos
+                                limited_result[key] = value[:500] + "..."
                             else:
                                 limited_result[key] = value
-                        result_str = json.dumps(limited_result, ensure_ascii=False)
+                        result_str = json.dumps(limited_result, ensure_ascii=False)[:max_result_chars]
                     else:
-                        result_str = result_str[:50000] + "... (resultado truncado)"
+                        result_str = result_str[:max_result_chars] + "\n... [Resultado truncado para limitar tokens]"
                 
                 # Agregar resultado al historial
                 self.messages.append({
@@ -227,12 +206,12 @@ class Agent:
         Returns:
             Respuesta del asistente
         """
-        # Limpiar contexto si está muy largo (cada 8 mensajes)
-        if len(self.messages) > 20:
-            self._trim_context(max_messages=12)
+        # Limpiar contexto AGRESIVAMENTE si está muy largo
+        if len(self.messages) > 10:
+            self._trim_context(max_messages=6)  # Solo últimos 6 mensajes
         
-        # Inyectar memoria reciente ANTES de procesar
-        self._inject_recent_memory()
+        # NO inyectar memoria (desactivado para ahorrar tokens)
+        # self._inject_recent_memory()
         
         self.add_user_message(user_input)
         response = self.get_completion(user_query=user_input)
