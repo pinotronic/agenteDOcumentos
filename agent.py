@@ -8,6 +8,7 @@ from openai import OpenAI
 from tools import TOOLS, TOOL_FUNCTIONS
 from config import ORCHESTRATOR_MODEL, ORCHESTRATOR_SYSTEM_PROMPT, REASONING_MODEL, REASONING_TASKS
 from conversation_memory import ConversationMemory
+from tool_selector import get_smart_tools
 
 
 class Agent:
@@ -83,21 +84,27 @@ class Agent:
         else:
             print(f"⚠️  [DEBUG] No hay contexto para inyectar: {context}")
     
-    def get_completion(self, force_reasoning=False):
+    def get_completion(self, force_reasoning=False, user_query=None):
         """
         Obtiene una respuesta del modelo.
         
         Args:
             force_reasoning: Si True, fuerza el uso del modelo de razonamiento
+            user_query: Query del usuario para selección inteligente de herramientas
         """
         # Seleccionar modelo apropiado
         model = REASONING_MODEL if force_reasoning else self.model
+        
+        # Selección dinámica de herramientas según la query
+        tools_to_use = self.tools
+        if user_query:
+            tools_to_use = get_smart_tools(user_query, self.tools)
         
         # Modelos de razonamiento (o3-mini) no soportan temperature
         params = {
             "model": model,
             "messages": self.messages,
-            "tools": self.tools
+            "tools": tools_to_use
         }
         
         # Solo agregar temperature si NO es un modelo de razonamiento
@@ -140,7 +147,7 @@ class Agent:
         else:
             return {"error": f"Función {fn_name} no encontrada"}
     
-    def process_response(self, response, use_reasoning=False):
+    def process_response(self, response, use_reasoning=False, user_query=None):
         """
         Procesa la respuesta del modelo y maneja llamadas a herramientas.
         Permite múltiples rondas de llamadas a herramientas si es necesario.
@@ -148,6 +155,7 @@ class Agent:
         Args:
             response: Respuesta del modelo
             use_reasoning: Si True, usa modelo de razonamiento en próxima iteración
+            user_query: Query del usuario para selección de herramientas
             
         Returns:
             Mensaje final del asistente
@@ -202,8 +210,8 @@ class Agent:
             
             # Obtener respuesta final del modelo (puede llamar más herramientas)
             # Si alguna herramienta requiere razonamiento, usar modelo apropiado
-            final_response = self.get_completion(force_reasoning=needs_reasoning)
-            return self.process_response(final_response, use_reasoning=needs_reasoning)  # Recursivo
+            final_response = self.get_completion(force_reasoning=needs_reasoning, user_query=user_query)
+            return self.process_response(final_response, use_reasoning=needs_reasoning, user_query=user_query)  # Recursivo
         else:
             # Respuesta directa sin herramientas
             return assistant_message.content
@@ -219,12 +227,16 @@ class Agent:
         Returns:
             Respuesta del asistente
         """
+        # Limpiar contexto si está muy largo (cada 8 mensajes)
+        if len(self.messages) > 20:
+            self._trim_context(max_messages=12)
+        
         # Inyectar memoria reciente ANTES de procesar
         self._inject_recent_memory()
         
         self.add_user_message(user_input)
-        response = self.get_completion()
-        assistant_response = self.process_response(response)
+        response = self.get_completion(user_query=user_input)
+        assistant_response = self.process_response(response, user_query=user_input)
         
         # Guardar turno completo en memoria
         tool_calls_list = []
@@ -250,6 +262,14 @@ class Agent:
         system_message = self.messages[0]
         self.messages = [system_message]
         print("🔄 Conversación reiniciada")
+    
+    def _trim_context(self, max_messages=10):
+        """Limita el contexto manteniendo solo los mensajes más recientes."""
+        if len(self.messages) > max_messages + 1:  # +1 por el system prompt
+            system_msg = self.messages[0]
+            recent_messages = self.messages[-(max_messages):]
+            self.messages = [system_msg] + recent_messages
+            print(f"✂️ Contexto recortado a {len(self.messages)} mensajes")
     
     def get_conversation_stats(self):
         """Obtiene estadísticas de la conversación actual y memoria persistente."""

@@ -487,3 +487,29 @@ activar el ambiente virtual: .\env\Scripts\Activate.ps1
 - Cada analisis ahora incluye `relationships` (dependencias internas, llamadas a servicios, datastores, colas/eventos, endpoints expuestos).
 - Nueva herramienta `get_relationship_graph`: devuelve nodos/edges para ver cómo se conectan archivos, servicios y datos.
 - ChromaDB puede operar en modo persistente: usa `CHROMA_PERSIST=1` y `CHROMA_PERSIST_PATH` (fallback automático a memoria si hay incompatibilidad en Windows/Python 3.13).
+
+## ⚡ Optimización de Tokens - Selección Dinámica de Herramientas
+
+Para evitar exceder el límite de contexto (128K tokens), el sistema ahora usa **selección inteligente de herramientas**:
+
+- **Problema**: 47 herramientas = ~3,200 tokens solo en definiciones
+- **Solución**: Solo carga las herramientas relevantes según tu consulta (máx 15)
+- **Beneficio**: Reduce hasta 70% el uso de tokens en herramientas
+
+### Categorías de Herramientas
+El sistema detecta palabras clave en tu consulta y selecciona automáticamente:
+
+1. **analysis**: "analiza", "explora", "busca", "estadísticas"
+2. **writing**: "crea", "escribe", "genera", "documenta"
+3. **dependencies**: "dependencias", "paquetes", "seguridad", "cves"
+4. **code_generation**: "tests", "docstrings", "config", "dockerfile"
+5. **assistance**: "explica", "debug", "ayuda", "error", "review"
+6. **external**: "stackoverflow", "api docs"
+7. **reports**: "dashboard", "reporte", "deuda técnica"
+8. **cicd**: "linter", "test", "build", "deployment"
+9. **gorila_mode**: "plan", "ejecuta plan", "supervisor", "dod"
+
+### Limpieza Automática de Contexto
+- El historial se recorta automáticamente cada 20 mensajes
+- Mantiene los 12 mensajes más recientes + prompt del sistema
+- La memoria conversacional persistente guarda todo en ChromaDB
