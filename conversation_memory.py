@@ -8,47 +8,74 @@ from typing import Dict, List, Optional, Any
 from datetime import datetime
 import json
 import hashlib
+import os
+import re
 
 
 class ConversationMemory:
     """Gestiona la memoria de conversaciones usando ChromaDB."""
-    
+
     def __init__(self, storage_path: str = "memory_storage", user_id: str = "default"):
         """
         Inicializa el sistema de memoria.
-        
+
         Args:
-            storage_path: Directorio para ChromaDB
+            storage_path: Directorio para ChromaDB persistente
             user_id: ID del usuario (para multi-usuario)
-        
-        Nota: Usando EphemeralClient por incompatibilidad de ChromaDB 1.3.6 
-        con Python 3.13 en Windows.
         """
         self.user_id = user_id
-        # Usar cliente en memoria por compatibilidad con Python 3.13
-        self.client = chromadb.EphemeralClient(
-            settings=Settings(anonymized_telemetry=False, allow_reset=True)
-        )
+        self.storage_path = os.path.abspath(storage_path)
+
+        # Intentar usar PersistentClient, fallback a EphemeralClient si falla
+        self.client = self._create_client()
         
         # Colección para mensajes de conversación
         self.messages_collection = self.client.get_or_create_collection(
             name="conversation_messages",
             metadata={"description": "Historial de mensajes con embeddings"}
         )
-        
+
         # Colección para contexto de sesiones
         self.sessions_collection = self.client.get_or_create_collection(
             name="conversation_sessions",
             metadata={"description": "Metadatos de sesiones"}
         )
-        
+
         # Colección para hechos importantes
         self.facts_collection = self.client.get_or_create_collection(
             name="user_facts",
             metadata={"description": "Hechos importantes del usuario"}
         )
-        
-        print(f"💾 Memoria inicializada: {self.get_statistics()['total_messages']} mensajes")
+
+        stats = self.get_statistics()
+        storage_type = "persistente" if self.is_persistent else "memoria"
+        print(f"[MEMORIA] Inicializada ({storage_type}): {stats['total_messages']} msgs, {stats['total_facts']} hechos")
+
+    def _create_client(self):
+        """
+        Crea cliente ChromaDB con fallback.
+        Intenta PersistentClient primero, si falla usa EphemeralClient.
+        """
+        self.is_persistent = False
+
+        # Intentar cliente persistente
+        try:
+            os.makedirs(self.storage_path, exist_ok=True)
+            client = chromadb.PersistentClient(
+                path=self.storage_path,
+                settings=Settings(
+                    anonymized_telemetry=False,
+                    allow_reset=True
+                )
+            )
+            self.is_persistent = True
+            print(f"[MEMORIA] Usando almacenamiento persistente: {self.storage_path}")
+            return client
+        except Exception as e:
+            print(f"[MEMORIA] PersistentClient falló ({e}), usando memoria volátil")
+            return chromadb.EphemeralClient(
+                settings=Settings(anonymized_telemetry=False, allow_reset=True)
+            )
     
     def save_message(
         self,
@@ -98,25 +125,27 @@ class ConversationMemory:
         user_message: str,
         assistant_response: str,
         tool_calls: Optional[List[Dict]] = None,
-        session_id: Optional[str] = None
-    ) -> Dict[str, str]:
+        session_id: Optional[str] = None,
+        auto_extract_facts: bool = True
+    ) -> Dict[str, Any]:
         """
         Guarda un turno completo de conversación (pregunta + respuesta).
-        
+
         Args:
             user_message: Mensaje del usuario
             assistant_response: Respuesta del asistente
             tool_calls: Llamadas a herramientas realizadas
             session_id: ID de sesión
-        
+            auto_extract_facts: Si debe extraer hechos automáticamente
+
         Returns:
-            IDs de los mensajes guardados
+            IDs de los mensajes guardados y hechos extraídos
         """
         if session_id is None:
             session_id = self._get_or_create_session()
-        
+
         user_id = self.save_message("user", user_message, session_id)
-        
+
         # Guardar tool calls si existen
         if tool_calls:
             for tool_call in tool_calls:
@@ -126,10 +155,28 @@ class ConversationMemory:
                     session_id,
                     {"tool_name": tool_call.get("name")}
                 )
-        
+
         assistant_id = self.save_message("assistant", assistant_response, session_id)
-        
-        return {"user": user_id, "assistant": assistant_id, "session": session_id}
+
+        result = {
+            "user": user_id,
+            "assistant": assistant_id,
+            "session": session_id,
+            "facts_extracted": []
+        }
+
+        # Extracción automática de hechos
+        if auto_extract_facts:
+            try:
+                result["facts_extracted"] = self.extract_facts_from_conversation(
+                    user_message=user_message,
+                    assistant_response=assistant_response,
+                    tool_results=tool_calls
+                )
+            except Exception as e:
+                print(f"[MEMORIA] Error extrayendo hechos: {e}")
+
+        return result
     
     def search_similar_conversations(
         self,
@@ -342,24 +389,163 @@ class ConversationMemory:
     def get_facts_summary(self) -> str:
         """Obtiene resumen de hechos importantes para incluir en prompts."""
         facts = self.get_facts(min_confidence=0.7)
-        
+
         if not facts:
             return ""
-        
+
         categories = {}
         for fact in facts:
             cat = fact["category"]
             if cat not in categories:
                 categories[cat] = []
             categories[cat].append(fact["fact"])
-        
-        lines = ["📌 INFORMACIÓN CONOCIDA DEL USUARIO:"]
+
+        lines = ["INFORMACION CONOCIDA DEL USUARIO:"]
         for cat, facts_list in categories.items():
             lines.append(f"\n{cat.upper()}:")
             for f in facts_list[:5]:  # Máximo 5 por categoría
-                lines.append(f"  • {f}")
-        
+                lines.append(f"  - {f}")
+
         return "\n".join(lines)
+
+    def extract_facts_from_conversation(
+        self,
+        user_message: str,
+        assistant_response: str,
+        tool_results: Optional[List[Dict]] = None
+    ) -> List[str]:
+        """
+        Extrae automáticamente hechos importantes de una conversación.
+        Usa patrones para detectar información relevante sin llamar a LLM.
+
+        Args:
+            user_message: Mensaje del usuario
+            assistant_response: Respuesta del asistente
+            tool_results: Resultados de herramientas ejecutadas
+
+        Returns:
+            Lista de IDs de hechos guardados
+        """
+        extracted_facts = []
+        combined_text = f"{user_message}\n{assistant_response}"
+
+        # Patrones para extraer hechos automáticamente
+        patterns = {
+            "tech_stack": [
+                # Menciones directas de tecnologías (más simples y efectivas)
+                (r'\b(usa|usando|utiliza|utilizando|con|en)\s+(Django|Flask|FastAPI|React|Vue|Angular|Next\.js|Express|Laravel|Spring|Rails)\b', 0.9),
+                (r'\b(Django|Flask|FastAPI|React|Vue|Angular|Next\.js|Express|Laravel|Spring|Rails)\s+(como|para|en el)\s+(backend|frontend|api)', 0.9),
+                (r'\b(proyecto|app|aplicacion|sistema)\s+(?:en|con|usa)\s+(Python|PHP|JavaScript|TypeScript|Java|Go|Rust|Ruby)\b', 0.85),
+                (r'\b(Python|PHP|JavaScript|TypeScript|Java|Go|Rust|Ruby|C\#|Kotlin|Swift)\s+(?:y|con)\s+(Python|PHP|JavaScript|TypeScript|Java|Go|Rust|Ruby|C\#|Kotlin|Swift)\b', 0.85),
+                # Bases de datos
+                (r'\b(PostgreSQL|MySQL|MariaDB|MongoDB|Redis|SQLite|Oracle|SQL Server|Elasticsearch|DynamoDB)\b', 0.85),
+                # Lenguajes y frameworks mencionados con contexto
+                (r'\b(trabajo|desarrollo|programo)\s+(con|en)\s+(\w+)', 0.8),
+            ],
+            "project_info": [
+                # Información del proyecto (más flexible)
+                (r'(?:el\s+)?proyecto\s+(?:se\s+llama|es)\s+["\']?([^\"\'\.\,]+)["\']?', 0.9),
+                (r'(?:estoy\s+)?(?:trabajando|desarrollando)\s+(?:en|un)\s+([^\.\,]{5,50})', 0.8),
+                (r'(?:el\s+)?repositorio\s+(?:es|esta\s+en)\s+([^\s\.\,]+)', 0.85),
+                (r'ruta[:\s]+([A-Za-z]:[/\\][^\s\.\,]+|/[^\s\.\,]+)', 0.9),
+            ],
+            "preferences": [
+                # Preferencias del usuario
+                (r'(?:yo\s+)?(prefiero|me\s+gusta|quiero|necesito)\s+(?:que\s+)?([^\.\,]{8,60})', 0.7),
+                (r'(siempre|normalmente|usualmente)\s+([^\.\,]{8,60})', 0.65),
+                (r'no\s+(?:me\s+)?(gusta|quiero|necesito)\s+([^\.\,]{8,60})', 0.7),
+            ],
+            "workflow": [
+                # Flujo de trabajo
+                (r'(?:usa|utiliza|ejecuta|activa)\s+(Smart\s*Orchestrator|modo\s+\w+)', 0.9),
+                (r'(?:mi\s+)?(?:flujo|proceso|workflow)\s+(?:es|incluye)\s+([^\.\,]+)', 0.8),
+            ],
+        }
+
+        # Extraer hechos usando patrones
+        for category, category_patterns in patterns.items():
+            for pattern, confidence in category_patterns:
+                matches = re.finditer(pattern, combined_text, re.IGNORECASE)
+                for match in matches:
+                    # Construir el hecho basado en el match
+                    fact_text = match.group(0).strip()
+                    if len(fact_text) > 10 and len(fact_text) < 200:
+                        # Evitar duplicados verificando similitud
+                        existing_facts = self.get_facts(category=category)
+                        is_duplicate = any(
+                            self._text_similarity(fact_text, f["fact"]) > 0.8
+                            for f in existing_facts
+                        )
+
+                        if not is_duplicate:
+                            fact_id = self.save_fact(
+                                fact=fact_text,
+                                category=category,
+                                confidence=confidence,
+                                source="auto_extraction"
+                            )
+                            extracted_facts.append(fact_id)
+
+        # Extraer información de herramientas ejecutadas
+        if tool_results:
+            for tool_result in tool_results:
+                tool_name = tool_result.get("name", "")
+
+                # Extraer paths de proyectos analizados
+                if tool_name in ["explore_directory", "analyze_directory", "read_file"]:
+                    content = str(tool_result.get("content", ""))
+                    # Detectar rutas de proyectos
+                    path_match = re.search(r'["\']((?:[A-Za-z]:)?[/\\][^"\']+)["\']', content)
+                    if path_match:
+                        project_path = path_match.group(1)
+                        fact_id = self.save_fact(
+                            fact=f"Proyecto en ruta: {project_path}",
+                            category="project_info",
+                            confidence=0.95,
+                            source=f"tool:{tool_name}"
+                        )
+                        extracted_facts.append(fact_id)
+
+                # Extraer tecnologías detectadas
+                if "detected_frameworks" in str(tool_result) or "detected_languages" in str(tool_result):
+                    content = str(tool_result.get("content", ""))
+                    frameworks = re.findall(r'detected_frameworks["\']?\s*:\s*\[([^\]]+)\]', content)
+                    languages = re.findall(r'detected_languages["\']?\s*:\s*\[([^\]]+)\]', content)
+
+                    for fw_list in frameworks:
+                        for fw in re.findall(r'["\']([^"\']+)["\']', fw_list):
+                            fact_id = self.save_fact(
+                                fact=f"Proyecto usa framework: {fw}",
+                                category="tech_stack",
+                                confidence=0.95,
+                                source=f"tool:{tool_name}"
+                            )
+                            extracted_facts.append(fact_id)
+
+                    for lang_list in languages:
+                        for lang in re.findall(r'["\']([^"\']+)["\']', lang_list):
+                            fact_id = self.save_fact(
+                                fact=f"Proyecto usa lenguaje: {lang}",
+                                category="tech_stack",
+                                confidence=0.95,
+                                source=f"tool:{tool_name}"
+                            )
+                            extracted_facts.append(fact_id)
+
+        if extracted_facts:
+            print(f"[MEMORIA] Extraidos {len(extracted_facts)} hechos automaticamente")
+
+        return extracted_facts
+
+    def _text_similarity(self, text1: str, text2: str) -> float:
+        """Calcula similitud simple entre dos textos (Jaccard)."""
+        words1 = set(text1.lower().split())
+        words2 = set(text2.lower().split())
+        if not words1 or not words2:
+            return 0.0
+        intersection = words1 & words2
+        union = words1 | words2
+        return len(intersection) / len(union)
     
     def _get_or_create_session(self) -> str:
         """Obtiene o crea una sesión para el día actual."""
@@ -373,6 +559,7 @@ class ConversationMemory:
             self.sessions_collection.upsert(
                 ids=[session_id],
                 documents=[f"Sesión del {datetime.now().strftime('%d/%m/%Y')}"],
+                embeddings=[[0.0] * 384],
                 metadatas=[{
                     "user_id": self.user_id,
                     "date": datetime.now().strftime('%Y-%m-%d'),

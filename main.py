@@ -88,12 +88,24 @@ def print_banner():
 
 def main():
     """Función principal que ejecuta el loop de conversación."""
+    import os
+    
     print_banner()
     
-    # Crear instancia del agente orquestador
-    agent = Agent(name="Orquestador")
+    # Seleccionar estrategia de orquestación
+    use_smart = os.getenv("USE_SMART_ORCHESTRATOR", "false").lower() == "true"
     
-    print(f"\n✅ Agente iniciado con modelo: {agent.model}")
+    if use_smart:
+        from smart_orchestrator import SmartOrchestrator
+        agent = SmartOrchestrator(user_id="pvargas", enable_cache=True)
+        print(f"\n✅ Smart Orchestrator iniciado (3 fases optimizadas)")
+        print("   💡 Ahorro estimado: 90%+ en tokens")
+        print("   ⚡ Caché activado")
+    else:
+        agent = Agent(name="Orquestador")
+        print(f"\n✅ Agente tradicional iniciado con modelo: {agent.model}")
+        print("   💡 Tip: Activa Smart Orchestrator con USE_SMART_ORCHESTRATOR=true en .env")
+    
     print("Listo para recibir comandos...\n")
     
     # Loop principal de conversación
@@ -111,28 +123,43 @@ def main():
                 break
             
             if user_input.lower() == "reset":
-                agent.reset_conversation()
+                if hasattr(agent, 'reset'):
+                    agent.reset()
+                else:
+                    agent.reset_conversation()
                 continue
             
             if user_input.lower() == "stats":
-                stats = agent.get_conversation_stats()
-                print(f"\n📊 Estadísticas de la sesión:")
-                print(f"   • Mensajes totales: {stats['total_messages']}")
-                print(f"   • Mensajes del usuario: {stats['user_messages']}")
-                print(f"   • Llamadas a herramientas: {stats['tool_calls']}")
-                print(f"   • Modelo: {stats['model']}")
-                print(f"\n💾 Memoria persistente:")
-                mem = stats['memory']
-                print(f"   • Total mensajes guardados: {mem['total_messages']}")
-                print(f"   • Total sesiones: {mem['total_sessions']}")
-                print(f"   • Hechos importantes: {mem['total_facts']}")
-                print(f"   • Por rol: {mem['messages_by_role']}")
+                if hasattr(agent, 'get_stats'):
+                    # Smart Orchestrator
+                    stats = agent.get_stats()
+                    print(f"\n📊 Estadísticas Smart Orchestrator:")
+                    print(f"   Total llamadas: {stats['total_calls']}")
+                    print(f"   Cache hits: {stats['cache_hits']}")
+                    print(f"   Cache hit rate: {stats['cache_hit_rate']:.1%}")
+                    print(f"   Cache size: {stats['cache_size']} entradas")
+                    print(f"   Tokens ahorrados: {stats['total_tokens_saved']:,}")
+                else:
+                    # Agent tradicional
+                    stats = agent.get_conversation_stats()
+                    print(f"\n📊 Estadísticas de la sesión:")
+                    print(f"   • Mensajes totales: {stats['total_messages']}")
+                    print(f"   • Mensajes del usuario: {stats['user_messages']}")
+                    print(f"   • Llamadas a herramientas: {stats['tool_calls']}")
+                    print(f"   • Modelo: {stats['model']}")
+                    print(f"\n💾 Memoria persistente:")
+                    mem = stats['memory']
+                    print(f"   • Total mensajes guardados: {mem['total_messages']}")
+                    print(f"   • Total sesiones: {mem['total_sessions']}")
+                    print(f"   • Hechos importantes: {mem['total_facts']}")
+                    print(f"   • Por rol: {mem['messages_by_role']}")
                 continue
             
             # Obtener y mostrar respuesta del agente
-            print(f"\n🤖 {agent.name} procesando...\n")
+            agent_name = getattr(agent, 'name', 'Smart Orchestrator')
+            print(f"\n🤖 {agent_name} procesando...\n")
             response = agent.chat(user_input)
-            print(f"\n🤖 {agent.name}: {response}")
+            print(f"\n🤖 {agent_name}: {response}")
             
         except KeyboardInterrupt:
             print("\n\n🤖 Orquestador: ¡Análisis interrumpido! Hasta luego.")

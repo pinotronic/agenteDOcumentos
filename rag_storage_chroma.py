@@ -192,6 +192,10 @@ Responde en formato JSON según las instrucciones.
             deps = relationships.get("intra_repo_dependencies") or []
             if deps:
                 parts.append(f"REL_DEPENDS_ON: {', '.join(deps[:10])}")
+
+            calls_internal = relationships.get("intra_repo_calls") or []
+            if calls_internal:
+                parts.append(f"REL_CALLS_INTERNAL: {', '.join([str(x) for x in calls_internal[:10]])}")
             for call in (relationships.get("cross_service_calls") or [])[:10]:
                 target = call.get("target", "external")
                 desc = call.get("description", "")
@@ -460,6 +464,20 @@ Responde en formato JSON según las instrucciones.
             if node_id not in nodes:
                 nodes[node_id] = {"id": node_id, "label": label or node_id, "type": kind}
 
+        def infer_node_kind_for_dep(dep: str) -> str:
+            """Heurística: si parece path a archivo, tratar como file."""
+            if not dep:
+                return "module"
+            d = dep.strip()
+            # Paths típicos en Windows o relativos
+            if ":\\" in d or "\\" in d or "/" in d:
+                return "file"
+            # Extensiones comunes
+            lower = d.lower()
+            if lower.endswith((".py", ".js", ".ts", ".php", ".java", ".cs")):
+                return "file"
+            return "module"
+
         for metadata in results.get("metadatas", []):
             src = metadata.get("file_path")
             if not src:
@@ -489,10 +507,25 @@ Responde en formato JSON según las instrucciones.
             # Dependencias internas (por nombre de modulo/ruta)
             for dep in relationships.get("intra_repo_dependencies", []) or []:
                 target = dep.strip()
-                add_node(target, target, "module")
+                kind = infer_node_kind_for_dep(target)
+                label = target.split("/")[-1].split("\\")[-1] if kind == "file" else target
+                add_node(target, label, kind)
                 edge_key = (src, target, "depends_on")
                 if edge_key not in seen_edges:
                     edges.append({"from": src, "to": target, "type": "depends_on"})
+                    seen_edges.add(edge_key)
+
+            # Llamadas internas (comunicación) archivo -> archivo
+            for called in relationships.get("intra_repo_calls", []) or []:
+                target = str(called).strip()
+                if not target:
+                    continue
+                kind = infer_node_kind_for_dep(target)
+                label = target.split("/")[-1].split("\\")[-1] if kind == "file" else target
+                add_node(target, label, kind)
+                edge_key = (src, target, "calls")
+                if edge_key not in seen_edges:
+                    edges.append({"from": src, "to": target, "type": "calls"})
                     seen_edges.add(edge_key)
 
             # Servicios externos
@@ -545,6 +578,271 @@ Responde en formato JSON según las instrucciones.
             "stats": {"nodes": len(nodes), "edges": len(edges)},
             "storage_mode": getattr(self, "storage_mode", "ephemeral")
         }
+
+    def get_file_trace(self, file_path: str, include_external: bool = False) -> Dict[str, Any]:
+        """Retorna trazabilidad de comunicación/dependencia para un archivo.
+
+        Incluye:
+        - Outgoing: edges desde el archivo hacia otros (depends_on, calls, etc.)
+        - Incoming: edges desde otros hacia el archivo
+        - Detalles del documento (unresolved refs) si están presentes en relationships
+        """
+        try:
+            target_abs = str(Path(file_path).resolve())
+        except Exception:
+            target_abs = file_path
+
+        target_norm = target_abs.lower()
+
+        graph = self.get_relationship_graph(file_filter=None, include_external=include_external)
+        if not graph.get("success"):
+            return graph
+
+        edges = graph.get("edges") or []
+
+        outgoing = [e for e in edges if str(e.get("from", "")).lower() == target_norm]
+        incoming = [e for e in edges if str(e.get("to", "")).lower() == target_norm]
+
+        # Fallback: si no matcheó por path completo, intentar por sufijo (nombre de archivo)
+        if not outgoing and not incoming:
+            suffix = Path(target_abs).name.lower()
+            if suffix:
+                candidates = [n.get("id") for n in (graph.get("nodes") or []) if str(n.get("id", "")).lower().endswith(suffix)]
+                candidates = list(dict.fromkeys([c for c in candidates if c]))
+                if len(candidates) == 1:
+                    only = candidates[0]
+                    target_abs = only
+                    target_norm = only.lower()
+                    outgoing = [e for e in edges if str(e.get("from", "")).lower() == target_norm]
+                    incoming = [e for e in edges if str(e.get("to", "")).lower() == target_norm]
+
+        def group_by_type(edge_list):
+            grouped: Dict[str, List[Dict[str, Any]]] = {}
+            for e in edge_list:
+                t = e.get("type", "unknown")
+                grouped.setdefault(t, []).append(e)
+            return grouped
+
+        outgoing_grouped = group_by_type(outgoing)
+        incoming_grouped = group_by_type(incoming)
+
+        # Extraer relationships detalladas del documento (si existe)
+        details: Dict[str, Any] = {}
+        doc_id = self._generate_doc_id(target_abs)
+        try:
+            result = self.collection.get(ids=[doc_id], include=["metadatas"])
+            if result.get("ids"):
+                metadata = result.get("metadatas", [{}])[0] or {}
+                rel = None
+                rel_json = metadata.get("relationships_json")
+                if rel_json:
+                    try:
+                        rel = json.loads(rel_json)
+                    except Exception:
+                        rel = None
+                if rel is None:
+                    try:
+                        analysis_obj = json.loads(metadata.get("analysis_json", "{}"))
+                        if isinstance(analysis_obj, dict):
+                            rel = analysis_obj.get("relationships") or {}
+                    except Exception:
+                        rel = {}
+
+                if isinstance(rel, dict):
+                    for k in [
+                        "intra_repo_dependencies_unresolved",
+                        "intra_repo_calls_unresolved",
+                        "intra_repo_dependencies_modules",
+                        "intra_repo_dependencies_trace_error",
+                    ]:
+                        if k in rel:
+                            details[k] = rel.get(k)
+        except Exception:
+            pass
+
+        return {
+            "success": True,
+            "target": target_abs,
+            "outgoing": outgoing_grouped,
+            "incoming": incoming_grouped,
+            "stats": {
+                "outgoing_edges": len(outgoing),
+                "incoming_edges": len(incoming),
+            },
+            "details": details,
+            "storage_mode": getattr(self, "storage_mode", "ephemeral"),
+        }
+
+    def get_trace_hotspots(
+        self,
+        scope: Optional[str] = None,
+        include_external: bool = False,
+        top_n: int = 20,
+    ) -> Dict[str, Any]:
+        """Rankings de trazabilidad (hotspots) para priorizar análisis.
+
+        Args:
+            scope: substring para filtrar archivos (por ruta/carpeta/nombre). None = todo.
+            include_external: incluye edges a servicios/eventos si True.
+            top_n: tamaño máximo de cada ranking.
+
+        Returns:
+            Diccionario con rankings:
+            - top_outgoing_calls: archivos que más llaman a otros
+            - top_incoming_calls: archivos más llamados por otros
+            - top_outgoing_depends: archivos con más dependencias
+            - top_incoming_depends: archivos más dependidos
+        """
+        graph = self.get_relationship_graph(file_filter=None, include_external=include_external)
+        if not graph.get("success"):
+            return graph
+
+        edges = graph.get("edges") or []
+        nodes = graph.get("nodes") or []
+
+        scope_l = (scope or "").lower().strip()
+
+        def norm(s: str) -> str:
+            return (s or "").lower().replace("\\", "/")
+
+        def in_scope(node_id: str) -> bool:
+            if not scope_l:
+                return True
+            return norm(scope_l) in norm(node_id or "")
+
+        # Solo considerar nodos tipo file y dentro de scope
+        file_nodes = {n.get("id") for n in nodes if n.get("type") == "file" and in_scope(n.get("id", ""))}
+
+        # Contadores por archivo
+        out_calls: Dict[str, int] = {}
+        in_calls: Dict[str, int] = {}
+        out_dep: Dict[str, int] = {}
+        in_dep: Dict[str, int] = {}
+
+        def bump(d: Dict[str, int], k: str):
+            d[k] = d.get(k, 0) + 1
+
+        for e in edges:
+            src = e.get("from")
+            dst = e.get("to")
+            et = e.get("type")
+            if not isinstance(src, str) or not isinstance(dst, str):
+                continue
+
+            # Filtrar a archivos (y scope)
+            if src not in file_nodes:
+                continue
+
+            if et == "calls":
+                bump(out_calls, src)
+                if dst in file_nodes:
+                    bump(in_calls, dst)
+            elif et == "depends_on":
+                bump(out_dep, src)
+                if dst in file_nodes:
+                    bump(in_dep, dst)
+
+        def top_items(counter: Dict[str, int]) -> List[Dict[str, Any]]:
+            items = sorted(counter.items(), key=lambda kv: kv[1], reverse=True)
+            out: List[Dict[str, Any]] = []
+            for k, v in items[: max(1, int(top_n))]:
+                out.append({"file": k, "count": v})
+            return out
+
+        return {
+            "success": True,
+            "scope": scope,
+            "include_external": include_external,
+            "top_n": top_n,
+            "top_outgoing_calls": top_items(out_calls),
+            "top_incoming_calls": top_items(in_calls),
+            "top_outgoing_depends": top_items(out_dep),
+            "top_incoming_depends": top_items(in_dep),
+            "storage_mode": getattr(self, "storage_mode", "ephemeral"),
+        }
+
+    def generate_trace_report_markdown(
+        self,
+        scope: Optional[str] = None,
+        include_external: bool = False,
+        top_n: int = 20,
+        per_file_edges_preview: int = 10,
+    ) -> str:
+        """Genera un reporte Markdown de trazabilidad (hotspots + previews).
+
+        Nota: el reporte se basa en los datos guardados en el RAG; si faltan archivos,
+        ejecuta analyze_directory o re-analiza los módulos deseados.
+        """
+        hotspots = self.get_trace_hotspots(scope=scope, include_external=include_external, top_n=top_n)
+        if not hotspots.get("success"):
+            return f"# Traceability Report\n\nError: {hotspots.get('error', 'unknown')}\n"
+
+        now = datetime.now().isoformat(timespec="seconds")
+        lines: List[str] = []
+        lines.append(f"# Traceability Report\n")
+        lines.append(f"- Generated: {now}\n")
+        lines.append(f"- Scope: {scope or 'ALL'}\n")
+        lines.append(f"- Include external: {include_external}\n")
+        lines.append(f"- Storage mode: {hotspots.get('storage_mode', 'unknown')}\n\n")
+
+        def section(title: str, items: List[Dict[str, Any]]):
+            lines.append(f"## {title}\n")
+            if not items:
+                lines.append("(no data)\n\n")
+                return
+            for it in items:
+                lines.append(f"- {it.get('count', 0)} — {it.get('file', '')}\n")
+            lines.append("\n")
+
+        section("Top Outgoing Calls (Top Talkers)", hotspots.get("top_outgoing_calls") or [])
+        section("Top Incoming Calls (Most Called)", hotspots.get("top_incoming_calls") or [])
+        section("Top Outgoing Dependencies", hotspots.get("top_outgoing_depends") or [])
+        section("Top Incoming Dependencies", hotspots.get("top_incoming_depends") or [])
+
+        # Previews por archivo: tomar los más relevantes (unir outgoing_calls + incoming_calls)
+        candidates = []
+        for it in (hotspots.get("top_outgoing_calls") or []):
+            candidates.append(it.get("file"))
+        for it in (hotspots.get("top_incoming_calls") or []):
+            candidates.append(it.get("file"))
+        # de-dup
+        candidates = list(dict.fromkeys([c for c in candidates if isinstance(c, str) and c]))
+
+        if candidates:
+            lines.append("## File Trace Previews\n")
+            for fp in candidates[: max(1, min(10, len(candidates)))]:
+                trace = self.get_file_trace(fp, include_external=include_external)
+                if not trace.get("success"):
+                    continue
+                lines.append(f"### {trace.get('target', fp)}\n")
+                stats = trace.get("stats") or {}
+                lines.append(f"- Outgoing edges: {stats.get('outgoing_edges', 0)}\n")
+                lines.append(f"- Incoming edges: {stats.get('incoming_edges', 0)}\n")
+
+                outgoing = trace.get("outgoing") or {}
+                incoming = trace.get("incoming") or {}
+
+                def edge_block(label: str, edge_list: List[Dict[str, Any]]):
+                    lines.append(f"\n**{label}**\n")
+                    if not edge_list:
+                        lines.append("- (none)\n")
+                        return
+                    for e in edge_list[: max(1, int(per_file_edges_preview))]:
+                        lines.append(f"- {e.get('type')} -> {e.get('to') if label.startswith('Outgoing') else e.get('from')}\n")
+
+                edge_block("Outgoing calls", outgoing.get("calls") or [])
+                edge_block("Outgoing depends_on", outgoing.get("depends_on") or [])
+                edge_block("Incoming calls", incoming.get("calls") or [])
+                edge_block("Incoming depends_on", incoming.get("depends_on") or [])
+
+                details = trace.get("details") or {}
+                if details:
+                    lines.append("\n**Details**\n")
+                    for k, v in details.items():
+                        lines.append(f"- {k}: {v}\n")
+                lines.append("\n")
+
+        return "".join(lines)
 
     def get_statistics(self) -> Dict[str, Any]:
         """

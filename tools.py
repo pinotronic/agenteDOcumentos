@@ -4,9 +4,14 @@ Define las funciones que el agente puede usar para análisis de código.
 """
 import os
 import json
+import subprocess
+import hashlib
+import re
+import shutil
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from datetime import datetime
+from collections import defaultdict
 
 from config import (
     ALL_EXTENSIONS, IGNORE_PATTERNS, BINARY_EXTENSIONS,
@@ -29,9 +34,14 @@ from evidence_generator import EvidenceGenerator
 from incremental_committer import IncrementalCommitter
 from plan_executor import PlanExecutor, list_directory_recursive
 from plan_supervisor import PlanSupervisor
+from intra_repo_tracing import detect_intra_repo_dependencies, detect_intra_repo_calls
+from conversation_memory import ConversationMemory
+from code_generator_agent import get_code_generator
 
 # Instancias globales
 _rag_storage = RAGStorage()
+_conversation_memory = None  # Se inicializa bajo demanda para evitar conflictos
+_code_gen_agent = None  # Se inicializa bajo demanda
 _code_analyzer = CodeAnalyzer()
 _doc_generator = DocumentationGenerator(rag_storage=_rag_storage)  # Compartir instancia
 _dependency_analyzer = DependencyAnalyzer()
@@ -322,6 +332,56 @@ def analyze_file(file_path: str) -> Dict[str, Any]:
         content=file_data["content"],
         file_type=file_data["type"]
     )
+
+    # Enriquecer relaciones con trazabilidad determinista (archivo -> archivo)
+    try:
+        relationships = analysis.get("relationships")
+        if not isinstance(relationships, dict):
+            relationships = {
+                "intra_repo_dependencies": [],
+                "cross_service_calls": [],
+                "datastores": [],
+                "events_or_queues": [],
+                "exposed_endpoints": []
+            }
+            analysis["relationships"] = relationships
+
+        trace = detect_intra_repo_dependencies(
+            file_path=file_data["file_path"],
+            content=file_data["content"],
+            file_type=file_data["type"],
+            repo_root=str(Path.cwd().resolve()),
+        )
+
+        if trace.resolved_file_paths:
+            # Preservar lo que haya venido del LLM (módulos/strings) pero priorizar paths reales
+            existing = relationships.get("intra_repo_dependencies") or []
+            if isinstance(existing, list) and existing:
+                # Heurística: si no parece path, guardarlo como módulo
+                existing_modules = [x for x in existing if isinstance(x, str) and ("/" not in x and "\\" not in x and not x.lower().endswith((".py", ".js", ".ts", ".php")))]
+                if existing_modules:
+                    relationships["intra_repo_dependencies_modules"] = list(dict.fromkeys(existing_modules))
+
+            # `intra_repo_dependencies` se convierte en lista de archivos (trazabilidad real)
+            relationships["intra_repo_dependencies"] = list(dict.fromkeys(trace.resolved_file_paths))
+
+        if trace.unresolved_refs:
+            relationships["intra_repo_dependencies_unresolved"] = trace.unresolved_refs[:50]
+
+        # Trazabilidad de comunicación (calls) intra-repo (inicialmente Python)
+        calls = detect_intra_repo_calls(
+            file_path=file_data["file_path"],
+            content=file_data["content"],
+            file_type=file_data["type"],
+            repo_root=str(Path.cwd().resolve()),
+        )
+        if calls.called_file_paths:
+            relationships["intra_repo_calls"] = calls.called_file_paths
+        if calls.unresolved_call_refs:
+            relationships["intra_repo_calls_unresolved"] = calls.unresolved_call_refs[:50]
+    except Exception as e:
+        # No romper el pipeline por trazabilidad
+        analysis.setdefault("relationships", {}).setdefault("intra_repo_dependencies_trace_error", str(e))
     
     # Guardar en RAG con indexación inteligente (pasa el contenido)
     doc_id = _rag_storage.save_analysis(
@@ -441,14 +501,136 @@ def search_in_rag(query: str, search_type: str = "keyword") -> Dict[str, Any]:
 
 def get_rag_statistics() -> Dict[str, Any]:
     """Obtiene estadísticas del RAG."""
-    print("⚙️ Obteniendo estadísticas del RAG")
+    print("[RAG] Obteniendo estadisticas del RAG")
     return _rag_storage.get_statistics()
+
+
+def query_memory(
+    query: str = None,
+    action: str = "search",
+    category: str = None,
+    limit: int = 5
+) -> Dict[str, Any]:
+    """
+    Consulta la memoria conversacional del agente.
+    Permite buscar conversaciones previas, hechos almacenados y contexto de sesiones.
+
+    Args:
+        query: Texto a buscar (para action=search)
+        action: search|facts|history|stats
+        category: Categoría de hechos (tech_stack, project_info, preferences, workflow)
+        limit: Máximo de resultados
+
+    Returns:
+        Información de memoria encontrada
+    """
+    global _conversation_memory
+
+    print(f"[MEMORIA] Consultando: action={action}, query={query[:30] if query else 'N/A'}...")
+
+    try:
+        # Inicializar memoria si no existe
+        if _conversation_memory is None:
+            _conversation_memory = ConversationMemory(user_id="default")
+
+        result = {
+            "success": True,
+            "action": action,
+            "data": None
+        }
+
+        if action == "search" and query:
+            # Búsqueda semántica en conversaciones
+            similar = _conversation_memory.search_similar_conversations(
+                query=query,
+                limit=limit
+            )
+            result["data"] = {
+                "query": query,
+                "matches": similar,
+                "count": len(similar)
+            }
+
+        elif action == "facts":
+            # Obtener hechos almacenados
+            facts = _conversation_memory.get_facts(category=category)
+            result["data"] = {
+                "facts": facts,
+                "count": len(facts),
+                "summary": _conversation_memory.get_facts_summary()
+            }
+
+        elif action == "history":
+            # Historial de sesión actual
+            session_id = _conversation_memory._get_or_create_session()
+            history = _conversation_memory.get_session_history(session_id, limit=limit)
+            result["data"] = {
+                "session_id": session_id,
+                "messages": history,
+                "count": len(history)
+            }
+
+        elif action == "stats":
+            # Estadísticas de memoria
+            stats = _conversation_memory.get_statistics()
+            result["data"] = stats
+
+        elif action == "context":
+            # Contexto reciente formateado
+            context = _conversation_memory.get_recent_context(limit=limit)
+            result["data"] = {
+                "context": context,
+                "chars": len(context)
+            }
+
+        else:
+            return {"success": False, "error": f"Accion no reconocida: {action}"}
+
+        return result
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 def get_relationship_graph(scope: str = None, include_external: bool = True) -> Dict[str, Any]:
     """Construye un grafo ligero de relaciones entre archivos/servicios/datos desde el RAG."""
     print(f"?? Construyendo grafo de relaciones (scope={scope})")
     return _rag_storage.get_relationship_graph(file_filter=scope, include_external=include_external)
+
+
+def get_file_trace(file_path: str, include_external: bool = False) -> Dict[str, Any]:
+    """Retorna trazabilidad entrante/saliente (calls/depends_on) para un archivo."""
+    print(f"?? Trazabilidad de archivo: {file_path}")
+    try:
+        resolved = str(Path(file_path).resolve())
+    except Exception:
+        resolved = file_path
+    return _rag_storage.get_file_trace(file_path=resolved, include_external=include_external)
+
+
+def get_trace_hotspots(scope: str = None, include_external: bool = False, top_n: int = 20) -> Dict[str, Any]:
+    """Retorna rankings de hotspots de comunicación/dependencias (calls/depends_on)."""
+    print(f"?? Hotspots de trazabilidad (scope={scope}, top_n={top_n})")
+    return _rag_storage.get_trace_hotspots(scope=scope, include_external=include_external, top_n=top_n)
+
+
+def generate_trace_report(scope: str = None, include_external: bool = False, top_n: int = 20, output_file: str = None) -> Dict[str, Any]:
+    """Genera un reporte Markdown de trazabilidad (hotspots + previews) y lo guarda en archivo."""
+    print(f"?? Generando reporte de trazabilidad (scope={scope}, top_n={top_n})")
+    try:
+        out = Path(output_file).resolve() if output_file else (Path.cwd() / "TRACEABILITY_REPORT.md").resolve()
+    except Exception:
+        out = Path.cwd() / "TRACEABILITY_REPORT.md"
+
+    md = _rag_storage.generate_trace_report_markdown(
+        scope=scope,
+        include_external=include_external,
+        top_n=top_n,
+    )
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(md, encoding="utf-8")
+    return {"success": True, "output_file": str(out), "bytes": out.stat().st_size}
 
 
 def list_files_in_dir(directory: str = ".") -> Dict[str, Any]:
@@ -601,6 +783,7 @@ def open_file_in_editor(file_path: str) -> Dict[str, Any]:
         from pathlib import Path
         import subprocess
         import os
+        import shutil
         
         # Verificar que el archivo existe
         file_path_obj = Path(file_path)
@@ -614,32 +797,73 @@ def open_file_in_editor(file_path: str) -> Dict[str, Any]:
         # Obtener ruta absoluta
         abs_path = str(file_path_obj.absolute())
         
-        # Abrir en VS Code
-        try:
-            # Intentar abrir con 'code' (VS Code CLI)
-            subprocess.run(['code', abs_path], check=False, shell=True)
-            
-            return {
-                "success": True,
-                "file_path": abs_path,
-                "message": f"Archivo abierto en editor: {file_path_obj.name}"
-            }
-        except Exception as cmd_error:
-            # Si falla, intentar con start (Windows)
-            if os.name == 'nt':
+        # Estrategia 1: Intentar abrir con VS Code CLI
+        vscode_commands = ['code', 'code.cmd', 'code-insiders']
+        vscode_found = False
+        
+        for cmd in vscode_commands:
+            if shutil.which(cmd):
+                try:
+                    result = subprocess.run(
+                        [cmd, abs_path],
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+                    
+                    if result.returncode == 0:
+                        print(f"✅ Archivo abierto en VS Code con comando: {cmd}")
+                        return {
+                            "success": True,
+                            "file_path": abs_path,
+                            "method": "vscode_cli",
+                            "message": f"Archivo abierto en VS Code: {file_path_obj.name}"
+                        }
+                    vscode_found = True
+                except Exception as e:
+                    print(f"⚠️ Error con {cmd}: {e}")
+                    continue
+        
+        # Estrategia 2: Usar editor predeterminado del sistema
+        if os.name == 'nt':  # Windows
+            try:
                 os.startfile(abs_path)
+                print(f"✅ Archivo abierto con editor predeterminado de Windows")
                 return {
                     "success": True,
                     "file_path": abs_path,
+                    "method": "windows_default",
+                    "message": f"Archivo abierto con editor predeterminado: {file_path_obj.name}",
+                    "note": "Si deseas usar VS Code, asegúrate de que esté instalado y en el PATH"
+                }
+            except Exception as e:
+                return {
+                    "error": f"No se pudo abrir el archivo: {str(e)}",
+                    "success": False
+                }
+        else:  # Linux/Mac
+            try:
+                # Intentar xdg-open (Linux) o open (Mac)
+                open_cmd = 'open' if os.uname().sysname == 'Darwin' else 'xdg-open'
+                subprocess.run([open_cmd, abs_path], check=True)
+                print(f"✅ Archivo abierto con comando: {open_cmd}")
+                return {
+                    "success": True,
+                    "file_path": abs_path,
+                    "method": "system_default",
                     "message": f"Archivo abierto con editor predeterminado: {file_path_obj.name}"
                 }
-            else:
-                raise cmd_error
+            except Exception as e:
+                return {
+                    "error": f"No se pudo abrir el archivo: {str(e)}",
+                    "success": False
+                }
     
     except Exception as e:
         return {
-            "error": str(e),
-            "success": False
+            "error": f"Error inesperado: {str(e)}",
+            "success": False,
+            "file_path": file_path
         }
 
 
@@ -1368,6 +1592,896 @@ def supervise_plan_execution(
     return _plan_supervisor.supervise_plan_execution(plan, _plan_executor, context)
 
 
+# =============================================================================
+# CODE GENERATOR AGENT - Generación de código multi-lenguaje
+# =============================================================================
+
+def ai_generate_code(
+    specification: str,
+    language: str = None,
+    generation_type: str = "general",
+    framework: str = None,
+    output_file: str = None
+) -> Dict[str, Any]:
+    """
+    [CODE-GENERATOR] Genera código basado en especificación en lenguaje natural.
+
+    Args:
+        specification: Descripción de lo que se quiere generar
+        language: Lenguaje objetivo (python, javascript, typescript, php, java, go) - auto-detecta si None
+        generation_type: Tipo de generación (general|api|crud|refactor)
+        framework: Framework específico (fastapi, express, laravel, spring, gin, etc.)
+        output_file: Archivo donde guardar el código (opcional)
+
+    Returns:
+        Código generado con validación de sintaxis
+    """
+    print(f"\n[AI-GENERATE] Generando código: {specification[:50]}...")
+
+    try:
+        agent = get_code_generator()
+        result = agent.generate_code(
+            specification=specification,
+            language=language,
+            generation_type=generation_type,
+            framework=framework,
+            output_file=output_file
+        )
+        return result
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def ai_generate_api(
+    endpoint_description: str,
+    method: str = "GET",
+    language: str = None,
+    framework: str = None,
+    include_tests: bool = False,
+    output_file: str = None
+) -> Dict[str, Any]:
+    """
+    [CODE-GENERATOR] Genera un endpoint de API REST completo.
+
+    Args:
+        endpoint_description: Descripción del endpoint (ej: "listar usuarios con paginación")
+        method: HTTP method (GET, POST, PUT, DELETE, PATCH)
+        language: Lenguaje (auto-detecta si None)
+        framework: Framework (fastapi, express, laravel, spring, gin)
+        include_tests: Si debe incluir tests del endpoint
+        output_file: Archivo de salida
+
+    Returns:
+        Código del endpoint con validaciones y manejo de errores
+    """
+    print(f"\n[AI-GENERATE] Generando API {method}: {endpoint_description[:50]}...")
+
+    try:
+        agent = get_code_generator()
+        result = agent.generate_api_endpoint(
+            endpoint_spec=endpoint_description,
+            method=method,
+            language=language,
+            framework=framework,
+            include_tests=include_tests,
+            output_file=output_file
+        )
+        return result
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def ai_generate_crud(
+    entity_name: str,
+    fields: Dict[str, str],
+    language: str = None,
+    framework: str = None,
+    include_soft_delete: bool = True,
+    include_pagination: bool = True,
+    output_dir: str = None
+) -> Dict[str, Any]:
+    """
+    [CODE-GENERATOR] Genera operaciones CRUD completas para una entidad.
+
+    Args:
+        entity_name: Nombre de la entidad (ej: "User", "Product")
+        fields: Campos de la entidad {"nombre": "tipo"} (ej: {"name": "string", "price": "float"})
+        language: Lenguaje objetivo
+        framework: Framework a usar
+        include_soft_delete: Incluir borrado lógico
+        include_pagination: Incluir paginación en listados
+        output_dir: Directorio para guardar archivos
+
+    Returns:
+        Código CRUD completo (modelo, repositorio, servicio, controlador)
+    """
+    print(f"\n[AI-GENERATE] Generando CRUD para: {entity_name}")
+
+    try:
+        agent = get_code_generator()
+        result = agent.generate_crud(
+            entity_name=entity_name,
+            fields=fields,
+            language=language,
+            framework=framework,
+            include_soft_delete=include_soft_delete,
+            include_pagination=include_pagination,
+            output_dir=output_dir
+        )
+        return result
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def ai_generate_function(
+    name: str,
+    description: str,
+    parameters: Dict[str, str] = None,
+    return_type: str = None,
+    language: str = None,
+    async_function: bool = False
+) -> Dict[str, Any]:
+    """
+    [CODE-GENERATOR] Genera una función individual.
+
+    Args:
+        name: Nombre de la función
+        description: Descripción de lo que hace la función
+        parameters: Parámetros {"nombre": "tipo"}
+        return_type: Tipo de retorno
+        language: Lenguaje
+        async_function: Si es función asíncrona
+
+    Returns:
+        Función generada con docstring y type hints
+    """
+    print(f"\n[AI-GENERATE] Generando función: {name}")
+
+    try:
+        agent = get_code_generator()
+        result = agent.generate_function(
+            name=name,
+            description=description,
+            parameters=parameters,
+            return_type=return_type,
+            language=language,
+            async_function=async_function
+        )
+        return result
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def ai_generate_class(
+    name: str,
+    description: str,
+    attributes: Dict[str, str] = None,
+    methods: List[Dict[str, str]] = None,
+    language: str = None,
+    parent_class: str = None
+) -> Dict[str, Any]:
+    """
+    [CODE-GENERATOR] Genera una clase completa.
+
+    Args:
+        name: Nombre de la clase
+        description: Descripción de la clase
+        attributes: Atributos {"nombre": "tipo"}
+        methods: Lista de métodos [{"name": "x", "description": "y", "params": "z"}]
+        language: Lenguaje
+        parent_class: Clase padre (herencia)
+
+    Returns:
+        Clase generada con constructor, métodos y docstrings
+    """
+    print(f"\n[AI-GENERATE] Generando clase: {name}")
+
+    try:
+        agent = get_code_generator()
+        result = agent.generate_class(
+            name=name,
+            description=description,
+            attributes=attributes,
+            methods=methods,
+            language=language,
+            parent_class=parent_class
+        )
+        return result
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def ai_refactor_code(
+    file_path: str = None,
+    code: str = None,
+    instructions: str = "Mejora la calidad y legibilidad del código",
+    output_file: str = None
+) -> Dict[str, Any]:
+    """
+    [CODE-GENERATOR] Refactoriza código existente.
+
+    Args:
+        file_path: Ruta del archivo a refactorizar
+        code: Código a refactorizar (alternativa a file_path)
+        instructions: Instrucciones específicas de refactorización
+        output_file: Archivo de salida (si None, sobreescribe original)
+
+    Returns:
+        Código refactorizado con lista de cambios realizados
+    """
+    print(f"\n[AI-GENERATE] Refactorizando: {file_path or 'código proporcionado'}")
+
+    try:
+        agent = get_code_generator()
+        result = agent.refactor_code(
+            file_path=file_path,
+            code=code,
+            instructions=instructions,
+            output_file=output_file
+        )
+        return result
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# =============================================================================
+# AGENT SKILLS - Herramientas importadas de skills.sh
+# =============================================================================
+
+def git_safe_workflow(
+    action: str,
+    message: str = None,
+    files: List[str] = None,
+    branch: str = None,
+    force: bool = False
+) -> Dict[str, Any]:
+    """
+    [SKILL: git-safe-workflow] Operaciones Git seguras para agentes IA.
+    Implementa protocolo de seguridad para prevenir operaciones destructivas.
+
+    Args:
+        action: Acción a realizar (status, diff, add, commit, branch, log, worktree_info)
+        message: Mensaje de commit (solo para action=commit)
+        files: Archivos específicos (para add/commit)
+        branch: Nombre de rama (para branch/checkout)
+        force: Forzar operación (requiere confirmación explícita)
+    """
+    print(f"\n🔒 [GIT-SAFE] Ejecutando: {action}")
+
+    # Comandos prohibidos por defecto
+    FORBIDDEN_COMMANDS = [
+        "reset --hard",
+        "clean -fd",
+        "push --force",
+        "push -f",
+        "rebase"  # Sin solicitud explícita
+    ]
+
+    # Ramas protegidas
+    PROTECTED_BRANCHES = ["main", "master", "develop", "production"]
+
+    try:
+        # Verificar que estamos en un repositorio Git
+        result = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, cwd=os.getcwd()
+        )
+        if result.returncode != 0:
+            return {"success": False, "error": "No es un repositorio Git válido"}
+
+        # Obtener información del repositorio
+        root_result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True
+        )
+        repo_root = root_result.stdout.strip()
+
+        branch_result = subprocess.run(
+            ["git", "branch", "--show-current"],
+            capture_output=True, text=True
+        )
+        current_branch = branch_result.stdout.strip()
+
+        response = {
+            "success": True,
+            "action": action,
+            "repo_root": repo_root,
+            "current_branch": current_branch,
+            "warnings": []
+        }
+
+        if action == "status":
+            # Estado seguro del repositorio
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                capture_output=True, text=True
+            )
+
+            diff_stat = subprocess.run(
+                ["git", "diff", "--stat"],
+                capture_output=True, text=True
+            )
+
+            response["status"] = {
+                "files": status.stdout.strip().split("\n") if status.stdout.strip() else [],
+                "diff_summary": diff_stat.stdout.strip(),
+                "is_clean": len(status.stdout.strip()) == 0
+            }
+            status_files = response["status"]["files"]
+            status_msg = "limpio" if response["status"]["is_clean"] else f"{len(status_files)} cambios"
+            print(f"   📊 Estado: {status_msg}")
+
+        elif action == "diff":
+            # Mostrar diferencias
+            diff = subprocess.run(
+                ["git", "diff", "--stat"] + (files or []),
+                capture_output=True, text=True
+            )
+            staged_diff = subprocess.run(
+                ["git", "diff", "--cached", "--stat"],
+                capture_output=True, text=True
+            )
+
+            response["diff"] = {
+                "unstaged": diff.stdout.strip(),
+                "staged": staged_diff.stdout.strip()
+            }
+
+        elif action == "add":
+            # Agregar archivos al staging
+            if not files:
+                # Usar -u en lugar de -A para evitar agregar archivos nuevos accidentalmente
+                add_result = subprocess.run(
+                    ["git", "add", "-u"],
+                    capture_output=True, text=True
+                )
+                response["added"] = "Archivos modificados (tracked)"
+            else:
+                add_result = subprocess.run(
+                    ["git", "add"] + files,
+                    capture_output=True, text=True
+                )
+                response["added"] = files
+
+            if add_result.returncode != 0:
+                return {"success": False, "error": add_result.stderr}
+            print(f"   ✅ Archivos agregados al staging")
+
+        elif action == "commit":
+            if not message:
+                return {"success": False, "error": "Se requiere mensaje de commit"}
+
+            # Verificar HEAD separado
+            head_check = subprocess.run(
+                ["git", "symbolic-ref", "-q", "HEAD"],
+                capture_output=True, text=True
+            )
+            if head_check.returncode != 0:
+                response["warnings"].append("⚠️ HEAD separado detectado - considera crear una rama primero")
+                if not force:
+                    return {
+                        "success": False,
+                        "error": "HEAD separado. Usa force=True o crea una rama primero",
+                        "suggestion": "git checkout -b nueva-rama"
+                    }
+
+            # Formato Conventional Commits
+            if not re.match(r'^(feat|fix|docs|style|refactor|test|chore|perf|ci|build|revert)(\(.+\))?: .+', message):
+                response["warnings"].append("⚠️ Mensaje no sigue Conventional Commits (feat|fix|docs|...)")
+
+            commit_result = subprocess.run(
+                ["git", "commit", "-m", message],
+                capture_output=True, text=True
+            )
+
+            if commit_result.returncode != 0:
+                return {"success": False, "error": commit_result.stderr}
+
+            response["commit"] = {
+                "message": message,
+                "output": commit_result.stdout.strip()
+            }
+            print(f"   ✅ Commit creado: {message[:50]}...")
+
+        elif action == "log":
+            # Log seguro
+            log_result = subprocess.run(
+                ["git", "log", "--oneline", "-10"],
+                capture_output=True, text=True
+            )
+            response["log"] = log_result.stdout.strip().split("\n")
+
+        elif action == "branch":
+            if branch:
+                # Verificar si es rama protegida
+                if branch in PROTECTED_BRANCHES and not force:
+                    return {
+                        "success": False,
+                        "error": f"'{branch}' es rama protegida. Usa force=True si realmente necesitas modificarla",
+                        "protected_branches": PROTECTED_BRANCHES
+                    }
+
+                # Crear nueva rama
+                branch_result = subprocess.run(
+                    ["git", "checkout", "-b", branch],
+                    capture_output=True, text=True
+                )
+                if branch_result.returncode != 0:
+                    # Intentar checkout si ya existe
+                    branch_result = subprocess.run(
+                        ["git", "checkout", branch],
+                        capture_output=True, text=True
+                    )
+
+                response["branch_action"] = f"Cambiado a rama: {branch}"
+            else:
+                # Listar ramas
+                branches = subprocess.run(
+                    ["git", "branch", "-a"],
+                    capture_output=True, text=True
+                )
+                response["branches"] = branches.stdout.strip().split("\n")
+
+        elif action == "worktree_info":
+            # Información de worktrees
+            worktree = subprocess.run(
+                ["git", "worktree", "list"],
+                capture_output=True, text=True
+            )
+            response["worktrees"] = worktree.stdout.strip().split("\n")
+
+        elif action == "push":
+            # NUNCA push a ramas protegidas sin rama propia
+            if current_branch in PROTECTED_BRANCHES and not force:
+                return {
+                    "success": False,
+                    "error": f"No se permite push directo a '{current_branch}'. Crea una rama feature primero.",
+                    "suggestion": f"git checkout -b feature/mi-cambio && git push -u origin feature/mi-cambio"
+                }
+
+            response["warnings"].append("⚠️ Push solo debe ejecutarse si el usuario lo solicita explícitamente")
+            response["push_blocked"] = True
+            response["reason"] = "Por seguridad, el push debe ser confirmado manualmente"
+
+        else:
+            return {"success": False, "error": f"Acción no reconocida: {action}"}
+
+        return response
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def security_leak_scan(
+    directory: str = ".",
+    scan_type: str = "full",
+    fix_mode: bool = False
+) -> Dict[str, Any]:
+    """
+    [SKILL: security-leak-guardrails] Escanea secretos y credenciales en el código.
+    Detecta API keys, passwords, tokens y otros datos sensibles antes de commit.
+
+    Args:
+        directory: Directorio a escanear
+        scan_type: Tipo de escaneo (full, staged, quick)
+        fix_mode: Si debe sugerir correcciones
+    """
+    print(f"\n🔐 [SECURITY-SCAN] Escaneando: {directory}")
+
+    # Patrones de secretos comunes
+    SECRET_PATTERNS = {
+        "api_key": [
+            r'(?i)(api[_-]?key|apikey)\s*[=:]\s*["\']?([a-zA-Z0-9_\-]{20,})["\']?',
+            r'(?i)api[_-]?key\s*[=:]\s*["\']([^"\']+)["\']',
+        ],
+        "aws_credentials": [
+            r'(?i)aws[_-]?(access[_-]?key[_-]?id|secret[_-]?access[_-]?key)\s*[=:]\s*["\']?([A-Z0-9]{16,})["\']?',
+            r'AKIA[0-9A-Z]{16}',  # AWS Access Key ID
+        ],
+        "password": [
+            r'(?i)(password|passwd|pwd|secret)\s*[=:]\s*["\']([^"\']{8,})["\']',
+            r'(?i)(password|passwd|pwd)\s*[=:]\s*["\']?(?![\$\{])([a-zA-Z0-9!@#$%^&*]{8,})["\']?',
+        ],
+        "private_key": [
+            r'-----BEGIN (RSA |DSA |EC |OPENSSH )?PRIVATE KEY-----',
+            r'-----BEGIN PGP PRIVATE KEY BLOCK-----',
+        ],
+        "token": [
+            r'(?i)(bearer|token|auth[_-]?token|access[_-]?token)\s*[=:]\s*["\']?([a-zA-Z0-9_\-\.]{20,})["\']?',
+            r'ghp_[a-zA-Z0-9]{36}',  # GitHub Personal Access Token
+            r'gho_[a-zA-Z0-9]{36}',  # GitHub OAuth Token
+            r'github_pat_[a-zA-Z0-9_]{22,}',  # GitHub PAT (new format)
+        ],
+        "connection_string": [
+            r'(?i)(mongodb|mysql|postgresql|redis|amqp)://[^\s"\']+',
+            r'(?i)server\s*=\s*[^;]+;\s*database\s*=\s*[^;]+;\s*(user|uid)\s*=',
+        ],
+        "jwt": [
+            r'eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*',  # JWT Token
+        ],
+        "slack_webhook": [
+            r'https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[a-zA-Z0-9]+',
+        ],
+        "stripe_key": [
+            r'sk_live_[a-zA-Z0-9]{24,}',
+            r'pk_live_[a-zA-Z0-9]{24,}',
+        ],
+    }
+
+    # Archivos a ignorar
+    IGNORE_PATTERNS = [
+        r'\.git/',
+        r'node_modules/',
+        r'__pycache__/',
+        r'\.pyc$',
+        r'\.env\.example$',
+        r'\.env\.template$',
+        r'\.md$',  # Documentación
+        r'package-lock\.json$',
+        r'yarn\.lock$',
+        r'\.min\.js$',
+    ]
+
+    # Archivos de alto riesgo
+    HIGH_RISK_FILES = [
+        '.env',
+        '.env.local',
+        '.env.production',
+        'credentials.json',
+        'secrets.json',
+        'config.json',
+        'settings.py',
+        'config.py',
+        '.npmrc',
+        '.pypirc',
+        'id_rsa',
+        'id_dsa',
+        'id_ecdsa',
+        'id_ed25519',
+    ]
+
+    try:
+        path = Path(directory).resolve()
+        if not path.exists():
+            return {"success": False, "error": f"Directorio no existe: {directory}"}
+
+        results = {
+            "success": True,
+            "directory": str(path),
+            "scan_type": scan_type,
+            "findings": [],
+            "high_risk_files": [],
+            "statistics": {
+                "files_scanned": 0,
+                "secrets_found": 0,
+                "high_risk_files": 0,
+                "by_type": defaultdict(int)
+            },
+            "recommendations": []
+        }
+
+        # Obtener archivos a escanear
+        if scan_type == "staged":
+            # Solo archivos staged en git
+            staged = subprocess.run(
+                ["git", "diff", "--cached", "--name-only"],
+                capture_output=True, text=True, cwd=str(path)
+            )
+            files_to_scan = [path / f for f in staged.stdout.strip().split("\n") if f]
+        else:
+            # Todos los archivos
+            files_to_scan = []
+            for ext in ['*.py', '*.js', '*.ts', '*.json', '*.yml', '*.yaml', '*.env*', '*.php', '*.java', '*.go', '*.rb', '*.sh', '*.conf', '*.cfg', '*.ini']:
+                files_to_scan.extend(path.rglob(ext))
+
+        for file_path in files_to_scan:
+            # Verificar si debe ignorarse
+            should_ignore = False
+            for pattern in IGNORE_PATTERNS:
+                if re.search(pattern, str(file_path)):
+                    should_ignore = True
+                    break
+
+            if should_ignore:
+                continue
+
+            # Verificar archivos de alto riesgo
+            if file_path.name in HIGH_RISK_FILES:
+                results["high_risk_files"].append(str(file_path))
+                results["statistics"]["high_risk_files"] += 1
+
+            try:
+                content = file_path.read_text(encoding='utf-8', errors='ignore')
+                results["statistics"]["files_scanned"] += 1
+
+                # Buscar patrones de secretos
+                for secret_type, patterns in SECRET_PATTERNS.items():
+                    for pattern in patterns:
+                        matches = re.finditer(pattern, content)
+                        for match in matches:
+                            line_num = content[:match.start()].count('\n') + 1
+
+                            # Obtener contexto (línea completa)
+                            lines = content.split('\n')
+                            context_line = lines[line_num - 1] if line_num <= len(lines) else ""
+
+                            # Ofuscar el valor encontrado
+                            found_value = match.group(0)
+                            masked_value = found_value[:10] + "..." + found_value[-4:] if len(found_value) > 20 else "***REDACTED***"
+
+                            finding = {
+                                "file": str(file_path.relative_to(path)),
+                                "line": line_num,
+                                "type": secret_type,
+                                "severity": "HIGH" if secret_type in ["private_key", "aws_credentials", "password"] else "MEDIUM",
+                                "masked_value": masked_value,
+                                "context": context_line[:100] + "..." if len(context_line) > 100 else context_line
+                            }
+
+                            results["findings"].append(finding)
+                            results["statistics"]["secrets_found"] += 1
+                            results["statistics"]["by_type"][secret_type] += 1
+
+            except Exception as e:
+                continue  # Ignorar archivos que no se pueden leer
+
+        # Generar recomendaciones
+        if results["statistics"]["secrets_found"] > 0:
+            results["recommendations"].extend([
+                "🚨 NUNCA commits estos archivos con secretos",
+                "Usa variables de entorno o un gestor de secretos",
+                "Agrega patrones sensibles a .gitignore",
+                "Considera usar git-secrets o gitleaks como pre-commit hook"
+            ])
+
+        if results["high_risk_files"]:
+            results["recommendations"].append(
+                f"⚠️ Archivos de alto riesgo detectados: {', '.join([Path(f).name for f in results['high_risk_files'][:5]])}"
+            )
+
+        # Verificar .gitignore
+        gitignore_path = path / ".gitignore"
+        if gitignore_path.exists():
+            gitignore_content = gitignore_path.read_text()
+            missing_patterns = []
+            for pattern in ['.env', '*.pem', '*.key', 'credentials.json', 'secrets.*']:
+                if pattern not in gitignore_content:
+                    missing_patterns.append(pattern)
+
+            if missing_patterns:
+                results["recommendations"].append(
+                    f"Agregar a .gitignore: {', '.join(missing_patterns)}"
+                )
+
+        # Resumen
+        print(f"   📊 Archivos escaneados: {results['statistics']['files_scanned']}")
+        print(f"   🔍 Secretos encontrados: {results['statistics']['secrets_found']}")
+        print(f"   ⚠️ Archivos alto riesgo: {results['statistics']['high_risk_files']}")
+
+        if results["statistics"]["secrets_found"] > 0:
+            print(f"   🚨 ALERTA: Se encontraron posibles secretos!")
+
+        return results
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def file_organizer(
+    directory: str,
+    action: str = "analyze",
+    organize_by: str = "type",
+    dry_run: bool = True,
+    min_age_days: int = None
+) -> Dict[str, Any]:
+    """
+    [SKILL: file-organizer] Organiza archivos y carpetas inteligentemente.
+    Detecta duplicados, sugiere estructuras y limpia directorios.
+
+    Args:
+        directory: Directorio a organizar
+        action: analyze|organize|find_duplicates|cleanup_old
+        organize_by: type|date|project (cómo organizar)
+        dry_run: Si True, solo muestra cambios sin ejecutar
+        min_age_days: Para cleanup_old, archivos más antiguos que N días
+    """
+    print(f"\n📁 [FILE-ORGANIZER] {action}: {directory}")
+
+    # Categorías de archivos por extensión
+    FILE_CATEGORIES = {
+        "documents": ['.pdf', '.doc', '.docx', '.txt', '.rtf', '.odt', '.xls', '.xlsx', '.ppt', '.pptx'],
+        "images": ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.svg', '.webp', '.ico', '.tiff'],
+        "videos": ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm'],
+        "audio": ['.mp3', '.wav', '.flac', '.aac', '.ogg', '.wma'],
+        "archives": ['.zip', '.rar', '.7z', '.tar', '.gz', '.bz2'],
+        "code": ['.py', '.js', '.ts', '.java', '.cpp', '.c', '.go', '.rs', '.rb', '.php'],
+        "data": ['.json', '.xml', '.csv', '.yaml', '.yml', '.sql', '.db'],
+        "config": ['.ini', '.cfg', '.conf', '.env', '.toml'],
+    }
+
+    try:
+        path = Path(directory).resolve()
+        if not path.exists():
+            return {"success": False, "error": f"Directorio no existe: {directory}"}
+
+        results = {
+            "success": True,
+            "directory": str(path),
+            "action": action,
+            "dry_run": dry_run,
+            "statistics": {
+                "total_files": 0,
+                "total_size_mb": 0,
+                "by_category": defaultdict(lambda: {"count": 0, "size_mb": 0}),
+                "by_extension": defaultdict(int),
+            },
+            "proposed_changes": [],
+            "duplicates": [],
+            "old_files": []
+        }
+
+        # Recolectar información de archivos
+        all_files = []
+        file_hashes = defaultdict(list)  # Para detectar duplicados
+
+        for file_path in path.rglob("*"):
+            if file_path.is_file() and not any(p in str(file_path) for p in ['.git', '__pycache__', 'node_modules']):
+                try:
+                    stat = file_path.stat()
+                    file_info = {
+                        "path": file_path,
+                        "name": file_path.name,
+                        "extension": file_path.suffix.lower(),
+                        "size_bytes": stat.st_size,
+                        "modified": datetime.fromtimestamp(stat.st_mtime),
+                        "category": "other"
+                    }
+
+                    # Determinar categoría
+                    for category, extensions in FILE_CATEGORIES.items():
+                        if file_info["extension"] in extensions:
+                            file_info["category"] = category
+                            break
+
+                    all_files.append(file_info)
+                    results["statistics"]["total_files"] += 1
+                    results["statistics"]["total_size_mb"] += stat.st_size / (1024 * 1024)
+                    results["statistics"]["by_category"][file_info["category"]]["count"] += 1
+                    results["statistics"]["by_category"][file_info["category"]]["size_mb"] += stat.st_size / (1024 * 1024)
+                    results["statistics"]["by_extension"][file_info["extension"]] += 1
+
+                    # Calcular hash para archivos pequeños (< 50MB) para detectar duplicados
+                    if stat.st_size < 50 * 1024 * 1024 and action in ["analyze", "find_duplicates"]:
+                        file_hash = hashlib.md5(file_path.read_bytes()).hexdigest()
+                        file_hashes[file_hash].append(file_info)
+
+                except Exception:
+                    continue
+
+        if action == "analyze":
+            # Análisis general
+            results["analysis"] = {
+                "total_files": results["statistics"]["total_files"],
+                "total_size_mb": round(results["statistics"]["total_size_mb"], 2),
+                "categories": dict(results["statistics"]["by_category"]),
+                "top_extensions": dict(sorted(
+                    results["statistics"]["by_extension"].items(),
+                    key=lambda x: x[1],
+                    reverse=True
+                )[:10]),
+                "potential_duplicates": sum(1 for files in file_hashes.values() if len(files) > 1),
+                "recommendations": []
+            }
+
+            # Recomendaciones
+            if results["analysis"]["potential_duplicates"] > 0:
+                results["analysis"]["recommendations"].append(
+                    f"🔍 {results['analysis']['potential_duplicates']} grupos de posibles duplicados"
+                )
+
+            if results["statistics"]["by_category"]["other"]["count"] > results["statistics"]["total_files"] * 0.3:
+                results["analysis"]["recommendations"].append(
+                    "⚠️ Muchos archivos sin categoría clara - considera revisarlos"
+                )
+
+        elif action == "find_duplicates":
+            # Encontrar duplicados
+            for file_hash, files in file_hashes.items():
+                if len(files) > 1:
+                    total_wasted = sum(f["size_bytes"] for f in files[1:])
+                    results["duplicates"].append({
+                        "hash": file_hash[:8],
+                        "files": [str(f["path"]) for f in files],
+                        "count": len(files),
+                        "wasted_mb": round(total_wasted / (1024 * 1024), 2),
+                        "keep_suggestion": str(files[0]["path"]),  # Sugerir mantener el primero
+                    })
+
+            results["statistics"]["duplicate_groups"] = len(results["duplicates"])
+            results["statistics"]["wasted_space_mb"] = round(
+                sum(d["wasted_mb"] for d in results["duplicates"]), 2
+            )
+
+            print(f"   🔍 Grupos de duplicados: {len(results['duplicates'])}")
+            print(f"   💾 Espacio desperdiciado: {results['statistics']['wasted_space_mb']} MB")
+
+        elif action == "organize":
+            # Proponer organización
+            for file_info in all_files:
+                if organize_by == "type":
+                    new_dir = path / file_info["category"]
+                elif organize_by == "date":
+                    year_month = file_info["modified"].strftime("%Y/%Y-%m")
+                    new_dir = path / year_month
+                else:
+                    new_dir = path / file_info["category"]
+
+                new_path = new_dir / file_info["name"]
+
+                if new_path != file_info["path"]:
+                    change = {
+                        "from": str(file_info["path"]),
+                        "to": str(new_path),
+                        "category": file_info["category"]
+                    }
+                    results["proposed_changes"].append(change)
+
+                    if not dry_run:
+                        new_dir.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(file_info["path"]), str(new_path))
+
+            results["statistics"]["files_to_move"] = len(results["proposed_changes"])
+
+            if dry_run:
+                print(f"   📋 Cambios propuestos: {len(results['proposed_changes'])} archivos")
+                print(f"   ℹ️ Modo DRY-RUN: ningún archivo fue movido")
+            else:
+                print(f"   ✅ Archivos organizados: {len(results['proposed_changes'])}")
+
+        elif action == "cleanup_old":
+            # Encontrar archivos antiguos
+            if min_age_days is None:
+                min_age_days = 180  # 6 meses por defecto
+
+            cutoff_date = datetime.now() - timedelta(days=min_age_days)
+
+            for file_info in all_files:
+                if file_info["modified"] < cutoff_date:
+                    results["old_files"].append({
+                        "path": str(file_info["path"]),
+                        "modified": file_info["modified"].isoformat(),
+                        "age_days": (datetime.now() - file_info["modified"]).days,
+                        "size_mb": round(file_info["size_bytes"] / (1024 * 1024), 2)
+                    })
+
+            results["statistics"]["old_files_count"] = len(results["old_files"])
+            results["statistics"]["old_files_size_mb"] = round(
+                sum(f["size_mb"] for f in results["old_files"]), 2
+            )
+
+            print(f"   📅 Archivos > {min_age_days} días: {len(results['old_files'])}")
+            print(f"   💾 Espacio recuperable: {results['statistics']['old_files_size_mb']} MB")
+
+        # Convertir defaultdicts a dicts normales para serialización
+        results["statistics"]["by_category"] = dict(results["statistics"]["by_category"])
+        results["statistics"]["by_extension"] = dict(results["statistics"]["by_extension"])
+
+        return results
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# Importar timedelta para file_organizer
+from datetime import timedelta
+
+
 # Registro de funciones disponibles
 TOOL_FUNCTIONS = {
     "generate_analysis_plan": generate_analysis_plan,
@@ -1388,7 +2502,11 @@ TOOL_FUNCTIONS = {
     "analyze_directory": analyze_directory,
     "search_in_rag": search_in_rag,
     "get_rag_statistics": get_rag_statistics,
+    "query_memory": query_memory,
     "get_relationship_graph": get_relationship_graph,
+    "get_file_trace": get_file_trace,
+    "get_trace_hotspots": get_trace_hotspots,
+    "generate_trace_report": generate_trace_report,
     "create_file": create_file,
     "write_file": write_file,
     "append_to_file": append_to_file,
@@ -1424,6 +2542,17 @@ TOOL_FUNCTIONS = {
     "add_curl_test_to_php": add_curl_test_to_php,
     "test_php_endpoint": test_php_endpoint,
     "batch_add_curl_to_php_files": batch_add_curl_to_php_files,
+    # Agent Skills (importados de skills.sh)
+    "git_safe_workflow": git_safe_workflow,
+    "security_leak_scan": security_leak_scan,
+    "file_organizer": file_organizer,
+    # Code Generator Agent
+    "ai_generate_code": ai_generate_code,
+    "ai_generate_api": ai_generate_api,
+    "ai_generate_crud": ai_generate_crud,
+    "ai_generate_function": ai_generate_function,
+    "ai_generate_class": ai_generate_class,
+    "ai_refactor_code": ai_refactor_code,
 }
 
 # Definición de herramientas para OpenAI
@@ -1829,6 +2958,37 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "query_memory",
+            "description": "Consulta la memoria conversacional del agente. Busca en conversaciones previas, recupera hechos almacenados (preferencias, tech stack, info del proyecto), y obtiene contexto de sesiones anteriores. USA ESTA HERRAMIENTA cuando necesites recordar algo de conversaciones pasadas.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Texto a buscar en la memoria (para action=search)"
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["search", "facts", "history", "stats", "context"],
+                        "description": "search=buscar en conversaciones, facts=obtener hechos almacenados, history=historial de sesión, stats=estadísticas, context=contexto reciente formateado"
+                    },
+                    "category": {
+                        "type": "string",
+                        "enum": ["tech_stack", "project_info", "preferences", "workflow", "general"],
+                        "description": "Categoría de hechos a filtrar (solo para action=facts)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Máximo de resultados a retornar (default: 5)"
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_relationship_graph",
             "description": "Devuelve un grafo ligero con relaciones entre archivos, servicios y datos desde el RAG.",
             "parameters": {
@@ -1841,6 +3001,81 @@ TOOLS = [
                     "include_external": {
                         "type": "boolean",
                         "description": "Incluir servicios externos/eventos (default: true)."
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_file_trace",
+            "description": "Devuelve la trazabilidad de un archivo específico: edges entrantes/salientes (depends_on y calls) desde el RAG.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Ruta (relativa o absoluta) del archivo objetivo"
+                    },
+                    "include_external": {
+                        "type": "boolean",
+                        "description": "Incluir nodos/edges externos (default: false)."
+                    }
+                },
+                "required": ["file_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_trace_hotspots",
+            "description": "Devuelve rankings (hotspots) de archivos con más comunicación (calls) y dependencias (depends_on) en el RAG.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "description": "Filtro opcional por substring de ruta/carpeta/nombre (null = todo)."
+                    },
+                    "include_external": {
+                        "type": "boolean",
+                        "description": "Incluir nodos/edges externos (default: false)."
+                    },
+                    "top_n": {
+                        "type": "integer",
+                        "description": "Cantidad máxima de items por ranking (default: 20)."
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_trace_report",
+            "description": "Genera un reporte Markdown de trazabilidad (hotspots + previews) y lo guarda en el repo (default: TRACEABILITY_REPORT.md).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "description": "Filtro opcional por substring de ruta/carpeta/nombre (null = todo)."
+                    },
+                    "include_external": {
+                        "type": "boolean",
+                        "description": "Incluir nodos/edges externos (default: false)."
+                    },
+                    "top_n": {
+                        "type": "integer",
+                        "description": "Top N para rankings (default: 20)."
+                    },
+                    "output_file": {
+                        "type": "string",
+                        "description": "Ruta del archivo Markdown a escribir (opcional)."
                     }
                 },
                 "required": []
@@ -2425,6 +3660,337 @@ TOOLS = [
                     "limit": {
                         "type": "integer",
                         "description": "Número máximo de archivos PHP a procesar (default: 50, evita sobrecarga)"
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    # =========================================================================
+    # AGENT SKILLS - Herramientas importadas de skills.sh
+    # =========================================================================
+    {
+        "type": "function",
+        "function": {
+            "name": "git_safe_workflow",
+            "description": "🔒 [SKILL: git-safe-workflow] Operaciones Git seguras para agentes IA. Previene comandos destructivos (reset --hard, push --force), protege ramas principales (main/master), verifica HEAD separado, y sigue Conventional Commits. Usa SIEMPRE esta herramienta para operaciones Git en lugar de comandos directos.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "diff", "add", "commit", "branch", "log", "worktree_info", "push"],
+                        "description": "Acción Git a realizar de forma segura"
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Mensaje de commit (requerido para action=commit). Debe seguir Conventional Commits: feat|fix|docs|style|refactor|test|chore"
+                    },
+                    "files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Archivos específicos para add/commit (null = todos los modificados)"
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Nombre de rama para crear/cambiar (para action=branch)"
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Forzar operación en rama protegida o HEAD separado (requiere confirmación explícita del usuario)"
+                    }
+                },
+                "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "security_leak_scan",
+            "description": "🔐 [SKILL: security-leak-guardrails] Escanea código en busca de secretos y credenciales antes de commit. Detecta API keys, passwords, tokens, private keys, connection strings, JWT, AWS credentials, etc. EJECUTAR SIEMPRE antes de hacer commit para prevenir fugas de datos sensibles.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "directory": {
+                        "type": "string",
+                        "description": "Directorio a escanear (default: directorio actual)"
+                    },
+                    "scan_type": {
+                        "type": "string",
+                        "enum": ["full", "staged", "quick"],
+                        "description": "Tipo de escaneo: full=todo el proyecto, staged=solo archivos en staging git, quick=archivos comunes"
+                    },
+                    "fix_mode": {
+                        "type": "boolean",
+                        "description": "Si debe sugerir correcciones para los problemas encontrados"
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "file_organizer",
+            "description": "📁 [SKILL: file-organizer] Organiza archivos y carpetas inteligentemente. Analiza estructura, detecta duplicados por hash MD5, sugiere reorganización por tipo/fecha, identifica archivos antiguos. Ideal para limpiar directorios de descargas, proyectos desordenados o preparar archivado.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "directory": {
+                        "type": "string",
+                        "description": "Directorio a organizar (requerido)"
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["analyze", "organize", "find_duplicates", "cleanup_old"],
+                        "description": "analyze=análisis general, organize=proponer/ejecutar organización, find_duplicates=buscar archivos duplicados, cleanup_old=identificar archivos antiguos"
+                    },
+                    "organize_by": {
+                        "type": "string",
+                        "enum": ["type", "date", "project"],
+                        "description": "Criterio de organización: type=por tipo de archivo, date=por fecha, project=por proyecto"
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "Si True (default), solo muestra cambios sin ejecutar. False para aplicar cambios reales."
+                    },
+                    "min_age_days": {
+                        "type": "integer",
+                        "description": "Para cleanup_old: archivos más antiguos que N días (default: 180 = 6 meses)"
+                    }
+                },
+                "required": ["directory"]
+            }
+        }
+    },
+    # =========================================================================
+    # CODE GENERATOR AGENT - Generación de código multi-lenguaje
+    # =========================================================================
+    {
+        "type": "function",
+        "function": {
+            "name": "ai_generate_code",
+            "description": "[CODE-GENERATOR] Genera código basado en especificación en lenguaje natural. Soporta Python, JavaScript, TypeScript, PHP, Java, Go. Puede generar funciones, clases, módulos completos. El código generado incluye docstrings, type hints y manejo de errores.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "specification": {
+                        "type": "string",
+                        "description": "Descripción detallada de lo que se quiere generar (ej: 'función que valide emails con regex')"
+                    },
+                    "language": {
+                        "type": "string",
+                        "enum": ["python", "javascript", "typescript", "php", "java", "go"],
+                        "description": "Lenguaje objetivo (auto-detecta si no se especifica)"
+                    },
+                    "generation_type": {
+                        "type": "string",
+                        "enum": ["general", "api", "crud", "refactor"],
+                        "description": "Tipo de generación: general=código libre, api=endpoints REST, crud=operaciones CRUD, refactor=mejorar código"
+                    },
+                    "framework": {
+                        "type": "string",
+                        "description": "Framework específico (fastapi, django, express, laravel, spring, gin, etc.)"
+                    },
+                    "output_file": {
+                        "type": "string",
+                        "description": "Ruta del archivo donde guardar el código generado (opcional)"
+                    }
+                },
+                "required": ["specification"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ai_generate_api",
+            "description": "[CODE-GENERATOR] Genera un endpoint de API REST completo con validación, manejo de errores y documentación. Soporta FastAPI, Express, Laravel, Spring, Gin.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "endpoint_description": {
+                        "type": "string",
+                        "description": "Descripción del endpoint (ej: 'endpoint para listar usuarios con paginación y filtros')"
+                    },
+                    "method": {
+                        "type": "string",
+                        "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"],
+                        "description": "Método HTTP del endpoint"
+                    },
+                    "language": {
+                        "type": "string",
+                        "enum": ["python", "javascript", "typescript", "php", "java", "go"],
+                        "description": "Lenguaje objetivo"
+                    },
+                    "framework": {
+                        "type": "string",
+                        "description": "Framework (fastapi, express, laravel, spring, gin)"
+                    },
+                    "include_tests": {
+                        "type": "boolean",
+                        "description": "Si debe incluir tests unitarios para el endpoint"
+                    },
+                    "output_file": {
+                        "type": "string",
+                        "description": "Archivo de salida"
+                    }
+                },
+                "required": ["endpoint_description"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ai_generate_crud",
+            "description": "[CODE-GENERATOR] Genera operaciones CRUD completas: Modelo, Repositorio, Servicio y Controlador. Incluye validaciones, paginación y soft-delete opcional.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entity_name": {
+                        "type": "string",
+                        "description": "Nombre de la entidad (ej: 'User', 'Product', 'Order')"
+                    },
+                    "fields": {
+                        "type": "object",
+                        "description": "Campos de la entidad como {nombre: tipo} (ej: {\"name\": \"string\", \"price\": \"float\", \"active\": \"boolean\"})"
+                    },
+                    "language": {
+                        "type": "string",
+                        "enum": ["python", "javascript", "typescript", "php", "java", "go"],
+                        "description": "Lenguaje objetivo"
+                    },
+                    "framework": {
+                        "type": "string",
+                        "description": "Framework a usar"
+                    },
+                    "include_soft_delete": {
+                        "type": "boolean",
+                        "description": "Incluir borrado lógico con campo deleted_at (default: true)"
+                    },
+                    "include_pagination": {
+                        "type": "boolean",
+                        "description": "Incluir paginación en listados (default: true)"
+                    },
+                    "output_dir": {
+                        "type": "string",
+                        "description": "Directorio donde guardar los archivos generados"
+                    }
+                },
+                "required": ["entity_name", "fields"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ai_generate_function",
+            "description": "[CODE-GENERATOR] Genera una función individual con docstring, type hints y manejo de errores.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Nombre de la función"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Descripción de lo que hace la función"
+                    },
+                    "parameters": {
+                        "type": "object",
+                        "description": "Parámetros como {nombre: tipo} (ej: {\"user_id\": \"int\", \"email\": \"str\"})"
+                    },
+                    "return_type": {
+                        "type": "string",
+                        "description": "Tipo de retorno (ej: 'bool', 'List[User]', 'Dict[str, Any]')"
+                    },
+                    "language": {
+                        "type": "string",
+                        "enum": ["python", "javascript", "typescript", "php", "java", "go"],
+                        "description": "Lenguaje"
+                    },
+                    "async_function": {
+                        "type": "boolean",
+                        "description": "Si es función asíncrona (async/await)"
+                    }
+                },
+                "required": ["name", "description"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ai_generate_class",
+            "description": "[CODE-GENERATOR] Genera una clase completa con constructor, atributos, métodos y docstrings.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Nombre de la clase"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Descripción de la clase y su propósito"
+                    },
+                    "attributes": {
+                        "type": "object",
+                        "description": "Atributos como {nombre: tipo}"
+                    },
+                    "methods": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "description": {"type": "string"},
+                                "params": {"type": "string"}
+                            }
+                        },
+                        "description": "Lista de métodos [{name, description, params}]"
+                    },
+                    "language": {
+                        "type": "string",
+                        "enum": ["python", "javascript", "typescript", "php", "java", "go"],
+                        "description": "Lenguaje"
+                    },
+                    "parent_class": {
+                        "type": "string",
+                        "description": "Clase padre para herencia"
+                    }
+                },
+                "required": ["name", "description"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ai_refactor_code",
+            "description": "[CODE-GENERATOR] Refactoriza código existente mejorando calidad, legibilidad y aplicando mejores prácticas. Mantiene la funcionalidad original.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Ruta del archivo a refactorizar"
+                    },
+                    "code": {
+                        "type": "string",
+                        "description": "Código a refactorizar (alternativa a file_path)"
+                    },
+                    "instructions": {
+                        "type": "string",
+                        "description": "Instrucciones específicas de refactorización (ej: 'aplicar SOLID', 'mejorar nombres', 'añadir type hints')"
+                    },
+                    "output_file": {
+                        "type": "string",
+                        "description": "Archivo de salida (si no se especifica, sobreescribe el original)"
                     }
                 },
                 "required": []

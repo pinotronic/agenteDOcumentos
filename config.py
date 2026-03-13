@@ -22,6 +22,15 @@ REASONING_TASKS = [
 RAG_STORAGE_PATH = "rag_storage"
 RAG_INDEX_FILE = "rag_index.json"
 
+# Resumen local de memoria con Ollama
+MEMORY_SUMMARIZER_ENABLED = os.environ.get("OLLAMA_MEMORY_SUMMARIZER", "1").lower() not in {"0", "false", "no"}
+MEMORY_SUMMARIZER_BACKEND = os.environ.get("MEMORY_SUMMARIZER_BACKEND", "ollama")
+MEMORY_SUMMARIZER_OLLAMA_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+MEMORY_SUMMARIZER_OLLAMA_MODEL = os.environ.get("OLLAMA_MEMORY_MODEL", "qwen3.5:4b")
+MEMORY_SUMMARIZER_OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", "120"))
+MEMORY_SUMMARIZER_MAX_INPUT_CHARS = int(os.environ.get("MEMORY_SUMMARIZER_MAX_INPUT_CHARS", "5000"))
+MEMORY_SUMMARIZER_MAX_OUTPUT_CHARS = int(os.environ.get("MEMORY_SUMMARIZER_MAX_OUTPUT_CHARS", "2500"))
+
 # Límites de procesamiento
 MAX_FILE_SIZE_MB = 5
 MAX_TOKENS_PER_FILE = 100000  # Aproximado para archivos muy grandes

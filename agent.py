@@ -8,7 +8,9 @@ from openai import OpenAI
 from tools import TOOLS, TOOL_FUNCTIONS
 from config import ORCHESTRATOR_MODEL, ORCHESTRATOR_SYSTEM_PROMPT, REASONING_MODEL, REASONING_TASKS
 from conversation_memory import ConversationMemory
+from memory_summarizer import MemorySummarizer
 from tool_selector import get_smart_tools
+from toon_formatter import format_tool_result, estimate_token_savings
 
 
 class Agent:
@@ -31,6 +33,7 @@ class Agent:
         # Inicializar memoria conversacional
         self.memory = ConversationMemory(user_id=user_id)
         self.session_id = self.memory._get_or_create_session()
+        self.memory_summarizer = MemorySummarizer()
         
         # NO agregar contexto previo al inicio para ahorrar tokens
         # El usuario puede solicitar contexto explícitamente si lo necesita
@@ -45,14 +48,73 @@ class Agent:
         """Agrega un mensaje del usuario al historial."""
         self.messages.append({"role": "user", "content": content})
     
-    def _inject_recent_memory(self):
+    def _inject_recent_memory(self, user_query: str = None, max_tokens: int = 1500):
         """
-        Inyecta memoria reciente en el contexto antes de cada solicitud.
-        DESACTIVADO TEMPORALMENTE para ahorrar tokens.
+        Inyecta memoria relevante en el contexto antes de cada solicitud.
+        Usa búsqueda semántica para encontrar información relevante.
+
+        Args:
+            user_query: Query actual del usuario para búsqueda semántica
+            max_tokens: Máximo de tokens aproximados a inyectar (~4 chars = 1 token)
         """
-        # Desactivado: la memoria consume demasiados tokens
-        # Si el usuario necesita contexto, puede pedirlo explícitamente
-        pass
+        memory_context = []
+        chars_used = 0
+        max_chars = max_tokens * 4  # Aproximación: 4 chars ~ 1 token
+        similar_messages = []
+
+        # 1. Inyectar hechos conocidos (compacto, alta prioridad)
+        facts_summary = self.memory.get_facts_summary()
+
+        # 2. Buscar conversaciones similares si hay query
+        if user_query:
+            try:
+                similar_messages = self.memory.search_similar_conversations(
+                    query=user_query,
+                    limit=3,
+                    role_filter="assistant"  # Buscar en respuestas anteriores
+                )
+            except Exception as e:
+                print(f"[MEMORIA] Error buscando contexto similar: {e}")
+
+        summarized_context = self.memory_summarizer.summarize_memory(
+            user_query=user_query,
+            facts_summary=facts_summary,
+            similar_messages=similar_messages,
+            max_chars=max_chars,
+        )
+
+        if summarized_context:
+            memory_context.append(summarized_context)
+            chars_used = len(summarized_context)
+        else:
+            if facts_summary and len(facts_summary) < max_chars * 0.3:
+                memory_context.append(facts_summary)
+                chars_used += len(facts_summary)
+
+            if similar_messages and chars_used < max_chars * 0.7:
+                relevant_context = ["\nCONTEXTO RELACIONADO PREVIO:"]
+                for msg in similar_messages:
+                    if msg.get("relevance", 0) > 0.5:
+                        content = msg.get("content", "")[:300]
+                        if chars_used + len(content) < max_chars:
+                            relevant_context.append(f"- {content}")
+                            chars_used += len(content)
+
+                if len(relevant_context) > 1:
+                    memory_context.append("\n".join(relevant_context))
+
+        # 3. Inyectar en el system prompt si hay contenido
+        if len(self.messages) > 0 and self.messages[0]["role"] == "system":
+            base_prompt = self.messages[0]["content"]
+            if "\n\n---MEMORIA---" in base_prompt:
+                base_prompt = base_prompt.split("\n\n---MEMORIA---")[0]
+
+            if memory_context:
+                combined_context = "\n\n".join(memory_context)
+                self.messages[0]["content"] = f"{base_prompt}\n\n---MEMORIA---\n{combined_context}\n---FIN MEMORIA---"
+                print(f"[MEMORIA] Contexto inyectado: ~{chars_used // 4} tokens")
+            else:
+                self.messages[0]["content"] = base_prompt
     
     def get_completion(self, force_reasoning=False, user_query=None):
         """
@@ -153,31 +215,35 @@ class Agent:
             # Ejecutar cada herramienta llamada
             for tool_call in assistant_message.tool_calls:
                 fn_result = self.execute_tool_call(tool_call)
+                fn_name = tool_call.function.name
                 
-                # Limitar tamaño de respuesta AGRESIVAMENTE para no exceder límites de contexto
-                result_str = json.dumps(fn_result, ensure_ascii=False)
-                max_result_chars = 10000  # ~2.5K tokens máximo por resultado
+                # Convertir resultado a formato TOON (ahorro de 40-70% de tokens)
+                try:
+                    toon_result = format_tool_result(fn_result, tool_name=fn_name)
+                    
+                    # Limitar tamaño DESPUÉS de conversión TOON
+                    max_result_chars = 15000  # Incrementado porque TOON es más eficiente
+                    
+                    if len(toon_result) > max_result_chars:
+                        # Si aún es muy grande después de TOON, truncar con mensaje
+                        toon_result = toon_result[:max_result_chars] + "\n... [Resultado truncado - solicita paginación si necesitas más]"
+                    
+                    result_str = toon_result
+                    
+                    # Debug: mostrar ahorro de tokens
+                    if isinstance(fn_result, (dict, list)):
+                        json_str = json.dumps(fn_result, ensure_ascii=False)
+                        savings = estimate_token_savings(json_str)
+                        if savings.get("savings_percent", 0) > 0:
+                            print(f"   📊 Ahorro TOON: {savings['savings_percent']}% ({savings['tokens_saved']} tokens)")
                 
-                if len(result_str) > max_result_chars:
-                    # Si es muy grande, resumir agresivamente
-                    if isinstance(fn_result, dict):
-                        # Mantener estructura pero limitar arrays drasticamente
-                        limited_result = {}
-                        for key, value in fn_result.items():
-                            if isinstance(value, list):
-                                # Solo primeros 3 elementos
-                                if len(value) > 3:
-                                    limited_result[key] = value[:3] + [f"[... {len(value) - 3} elementos más truncados]"]
-                                else:
-                                    limited_result[key] = value
-                            elif isinstance(value, str) and len(value) > 500:
-                                # Truncar strings largos
-                                limited_result[key] = value[:500] + "..."
-                            else:
-                                limited_result[key] = value
-                        result_str = json.dumps(limited_result, ensure_ascii=False)[:max_result_chars]
-                    else:
-                        result_str = result_str[:max_result_chars] + "\n... [Resultado truncado para limitar tokens]"
+                except Exception as e:
+                    # Fallback a JSON si TOON falla
+                    print(f"⚠️ Error convirtiendo a TOON: {e}, usando JSON")
+                    result_str = json.dumps(fn_result, ensure_ascii=False)
+                    max_result_chars = 10000
+                    if len(result_str) > max_result_chars:
+                        result_str = result_str[:max_result_chars] + "\n... [Resultado truncado]"
                 
                 # Agregar resultado al historial
                 self.messages.append({
@@ -199,20 +265,20 @@ class Agent:
         """
         Método principal para interactuar con el agente.
         Ahora guarda turnos en memoria persistente.
-        
+
         Args:
             user_input: Entrada del usuario
-            
+
         Returns:
             Respuesta del asistente
         """
         # Limpiar contexto AGRESIVAMENTE si está muy largo
         if len(self.messages) > 10:
             self._trim_context(max_messages=6)  # Solo últimos 6 mensajes
-        
-        # NO inyectar memoria (desactivado para ahorrar tokens)
-        # self._inject_recent_memory()
-        
+
+        # Inyectar memoria relevante basada en la query actual
+        self._inject_recent_memory(user_query=user_input, max_tokens=1500)
+
         self.add_user_message(user_input)
         response = self.get_completion(user_query=user_input)
         assistant_response = self.process_response(response, user_query=user_input)
